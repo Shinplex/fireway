@@ -2,23 +2,6 @@ import { serve } from "https://deno.land/std@0.212.0/http/server.ts";
 import { getCookies, setCookie } from "https://deno.land/std@0.212.0/http/cookie.ts";
 import { crypto } from "https://deno.land/std@0.212.0/crypto/mod.ts";
 import { decodeBase64, encodeBase64 } from "https://deno.land/std@0.212.0/encoding/base64.ts";
-import { parse } from "https://deno.land/std@0.212.0/dotenv/mod.ts"; // For potential .env file loading
-
-// Attempt to load .env file if it exists
-try {
-    const envConfig = await parse(await Deno.readTextFile(".env"));
-    for (const key in envConfig) {
-        if (Deno.env.get(key) === undefined) {
-            Deno.env.set(key, envConfig[key]);
-        }
-    }
-} catch (e) {
-    // Ignore if .env file not found
-    if (!(e instanceof Deno.errors.NotFound)) {
-        console.error("Error loading .env file:", e);
-    }
-}
-
 
 // --- 配置 ---
 // 从环境变量获取，如果不存在则使用默认值
@@ -43,29 +26,15 @@ const ADMIN_USERNAME = Deno.env.get("ADMIN_USERNAME") || "admin";
 const DEFAULT_ADMIN_PASSWORD_HASH = "d82494f05d6917ba02f7aaa29689ccb444bb73f20380876cb05d1f37537b7892"; // hash of "adminadmin"
 const ADMIN_PASSWORD_HASH = Deno.env.get("ADMIN_PASSWORD_HASH") || DEFAULT_ADMIN_PASSWORD_HASH;
 
-// Public Key for data integrity verification (JWK format, generated on startup)
-let publicCryptoKeyJWK: JsonWebKey | undefined;
-
-
 // Session Cookie 限制 (每个 IP 最多同时拥有的 Session Cookie 数量)
 const MAX_SESSION_COOKIES_PER_IP = parseInt(Deno.env.get("MAX_SESSION_COOKIES_PER_IP") || "2", 10); // Default 2
 
 // PoW Configuration
-const POW_DIFFICULTY_LOW = parseInt(Deno.env.get("POW_DIFFICULTY_LOW") || "4", 10); // Number of leading zeros for low difficulty (for session acquisition)
-const POW_DIFFICULTY_MEDIUM = parseInt(Deno.env.get("POW_DIFFICULTY_MEDIUM") || "6", 10); // Number of leading zeros for medium difficulty (for supplemental verification)
-const POW_DIFFICULTY_HARD = parseInt(Deno.env.get("POW_DIFFICULTY_HARD") || "8", 10); // Number of leading zeros for hard difficulty (for supplemental verification)
+const POW_DIFFICULTY_LOW = parseInt(Deno.env.get("POW_DIFFICULTY_LOW") || "4", 10); // Number of leading zeros for low difficulty
+const POW_DIFFICULTY_MEDIUM = parseInt(Deno.env.get("POW_DIFFICULTY_MEDIUM") || "6", 10); // Number of leading zeros for medium difficulty
+const POW_DIFFICULTY_HARD = parseInt(Deno.env.get("POW_DIFFICULTY_HARD") || "8", 10); // Number of leading zeros for hard difficulty
 const POW_NONCE_LENGTH = parseInt(Deno.env.get("POW_NONCE_LENGTH") || "16", 10); // Length of the nonce
 const POW_SERVER_SECRET = Deno.env.get("POW_SERVER_SECRET") || "default_secret"; // Server secret for PoW target
-
-// Obfuscated Parameter Names for /fireway/requestClear
-const PARAM_WAY_CODE = "w";
-const PARAM_TURNSTILE_RESPONSE = "t";
-const PARAM_SESSION_COOKIE_VALUE = "s";
-const PARAM_POW_NONCE = "p";
-const PARAM_CLIENT_SUPPORT = "c";
-const PARAM_DATA_STRING = "d"; // Parameter for the data string to verify
-const PARAM_DATA_HASH = "h"; // Parameter for the hash of the data string
-
 
 // --- WAF 配置 ---
 // 从环境变量获取 WAF 规则，格式为 JSON 字符串数组
@@ -93,6 +62,8 @@ function compileWafRules() {
         }
     }).filter((r): r is RegExp => r !== null); // Filter out null and type assertion
 }
+// Compile rules on startup
+compileWafRules();
 
 
 // --- 豁免路径配置 ---
@@ -111,8 +82,20 @@ try {
 }
 
 // 将豁免路径分为前缀匹配和正则表达式匹配两类
-let EXEMPT_PATH_PREFIXES: string[] = [];
-let EXEMPT_PATH_REGEX: RegExp[] = [];
+let EXEMPT_PATH_PREFIXES = EXEMPT_PATHS.filter(path => !path.startsWith("/^") && !path.endsWith("$/"));
+let EXEMPT_PATH_REGEX: RegExp[] = EXEMPT_PATHS
+  .filter(path => path.startsWith("/^") && path.endsWith("$/"))
+  .map(path => {
+    try {
+      // Remove /^ and $/ to extract regex content
+      const regexStr = path.substring(2, path.length - 2);
+      return new RegExp(regexStr, "i");
+    } catch (e) {
+      console.error(`Invalid regex pattern in EXEMPT_PATHS: ${path}`, e);
+      return null;
+    }
+  })
+  .filter((r): r is RegExp => r !== null); // Filter out null and type assertion
 
 // Helper to compile exempt paths
 function compileExemptPaths() {
@@ -130,9 +113,7 @@ function compileExemptPaths() {
       })
       .filter((r): r is RegExp => r !== null);
 }
-
-// Compile rules and exempt paths on startup
-compileWafRules();
+// Compile exempt paths on startup
 compileExemptPaths();
 
 
@@ -148,8 +129,7 @@ const KV_PREFIX_IP_BLACKLIST = ["ip_blacklist"]; // 用于存储 IP 黑名单
 const KV_PREFIX_WAF_RULES = ["waf_rules"]; // 用于存储 WAF 规则 (在 KV中管理)
 const KV_PREFIX_EXEMPT_PATHS = ["exempt_paths"]; // 用于存储豁免路径 (在 KV 中管理)
 const KV_PREFIX_TARGET_CDN_URL = ["target_cdn_url"]; // 用于存储反代目标 URL (在 KV 中管理)
-const KV_PREFIX_POW_CHALLENGE = ["pow_challenge"]; // Stores PoW challenges (key: way_code -> value: { target, difficulty, type: 'initial' | 'supplemental' })
-
+const KV_PREFIX_POW_CHALLENGE = ["pow_challenge"]; // Stores PoW challenges (key: way_code -> value: { target, difficulty })
 
 // --- 自行实现的 IP 工具函数 ---
 
@@ -280,7 +260,7 @@ function isWithinCIDRManual(ip: string, cidr: string): boolean {
 }
 
 
-// --- 辅助函数 ---
+// --- 辅助函数 (其余部分与之前相同) ---
 
 // 生成指定长度的随机字符串 (任意字符)
 function generateRandomString(length: number): string {
@@ -321,29 +301,6 @@ async function verifyPow(target: string, nonce: string, difficulty: number): Pro
     // Check for leading zeros
     const requiredPrefix = '0'.repeat(difficulty);
     return hash.startsWith(requiredPrefix);
-}
-
-// Generate RSA Key Pair and export Public Key as JWK
-async function generateAndExportPublicKey(): Promise<JsonWebKey | undefined> {
-    try {
-        const keyPair = await crypto.subtle.generateKey(
-            {
-                name: "RSASSA-PKCS1-v1_5",
-                modulusLength: 2048, // Can be 2048, 4096, etc.
-                publicExponent: new Uint8Array([1, 0, 1]), // 65537
-                hash: "SHA-256",
-            },
-            false, // Not exportable (private key) - we only need the public key for verification
-            ["verify"] // Can be used for verification
-        );
-
-        const publicKeyJwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
-        console.log("Generated and exported public key (JWK).");
-        return publicKeyJwk;
-    } catch (e) {
-        console.error("Error generating or exporting key pair:", e);
-        return undefined;
-    }
 }
 
 
@@ -402,7 +359,7 @@ function getClientIp(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHttpI
 }
 
 // Build verification page HTML (simulating Cloudflare layout with dark/light mode, left align)
-function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hostname: string, wayCode: string, publicKeyJwk: JsonWebKey | undefined, powChallenge?: { target: string, difficulty: number, type: 'initial' | 'supplemental' }): string {
+function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hostname: string, wayCode: string, powChallenge?: { target: string, difficulty: number }): string {
   // Check if Site Key is set
   if (!siteKey || siteKey === "YOUR_TURNSTILE_SITE_KEY") {
       return `
@@ -444,10 +401,6 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
         </html>
       `;
   }
-
-  // Embed the public key as a JSON string
-  const publicKeyJwkString = publicKeyJwk ? JSON.stringify(publicKeyJwk) : 'null';
-
 
   return `
 <!DOCTYPE html>
@@ -635,19 +588,13 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
     const powChallenge = ${powChallenge ? JSON.stringify(powChallenge) : 'null'};
     const POW_NONCE_LENGTH = ${POW_NONCE_LENGTH};
 
-    // Server Public Key (JWK format)
-    const serverPublicKeyJwk = ${publicKeyJwkString};
-    let serverPublicKey = null; // Will store the imported CryptoKey
-
-
-     // Obfuscated Parameter Names
-    const PARAM_WAY_CODE = "${PARAM_WAY_CODE}";
-    const PARAM_TURNSTILE_RESPONSE = "${PARAM_TURNSTILE_RESPONSE}";
-    const PARAM_SESSION_COOKIE_VALUE = "${PARAM_SESSION_COOKIE_VALUE}";
-    const PARAM_POW_NONCE = "${PARAM_POW_NONCE}";
-    const PARAM_CLIENT_SUPPORT = "${PARAM_CLIENT_SUPPORT}";
-    const PARAM_DATA_STRING = "${PARAM_DATA_STRING}";
-    const PARAM_DATA_HASH = "${PARAM_DATA_HASH}";
+    // Obfuscated parameter names
+    const WAY_CODE_PARAM = 'a';
+    const POW_NONCE_PARAM = 'b';
+    const CLIENT_SUPPORT_PARAM = 'c';
+    const TURNSTILE_RESPONSE_PARAM = 'd';
+    const REDIRECT_PATH_PARAM = 'e';
+    const SESSION_COOKIE_VALUE_PARAM = 'f';
 
 
     // 在DOM加载完成后执行
@@ -658,39 +605,9 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       // 添加页脚
       createFooter();
 
-      // 导入公钥并初始化验证流程
-      importPublicKey().then(() => {
-          initVerificationFlow();
-      }).catch(e => {
-           console.error("Failed to import public key:", e);
-           handleVerificationError('Verification error. Failed to load security key.');
-      });
+      // 初始化验证流程
+      initVerificationFlow();
     });
-
-    // Import the public key from JWK format
-    async function importPublicKey() {
-        if (!serverPublicKeyJwk) {
-            console.warn("Server public key not provided.");
-            return;
-        }
-        try {
-            serverPublicKey = await crypto.subtle.importKey(
-                "jwk",
-                serverPublicKeyJwk,
-                {
-                    name: "RSASSA-PKCS1-v1_5",
-                    hash: "SHA-256",
-                },
-                true, // Exportable (not strictly needed here, but common)
-                ["verify"]
-            );
-            console.log("Public key imported successfully.");
-        } catch (e) {
-            console.error("Error importing public key:", e);
-            throw e; // Re-throw to stop the flow
-        }
-    }
-
 
     // 创建并插入所有UI元素
     function createUIElements() {
@@ -711,21 +628,21 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       const statusText = document.createElement('div');
       statusText.id = 'statusText';
       statusText.className = 'status-text';
-      statusText.textContent = 'Verifying your connection.'; // Neutral text
+      statusText.textContent = 'Verifying you are human. This may take a few seconds.';
       jsContent.appendChild(statusText);
 
-      // 创建成功消息 (无图标)
+      // 创建成功消息
       const successMessage = document.createElement('div');
       successMessage.id = 'successMessage';
       successMessage.className = 'success-message';
-      successMessage.textContent = 'Verification successful';
-      successMessage.style.display = 'none'; // Initially hidden
+      const successText = document.createTextNode('Verification successful');
+      successMessage.appendChild(successText);
       jsContent.appendChild(successMessage);
 
       // 创建验证表单
       const form = document.createElement('form');
       form.id = 'verificationForm';
-      form.action = '/fireway/requestClear'; // Updated endpoint
+      form.action = '/fireway/requestClear'; // Modified endpoint
       form.method = 'POST';
 
       // 创建Turnstile容器
@@ -740,53 +657,42 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       }
 
 
-      // 添加隐藏字段 (使用混淆参数名)
+      // 添加隐藏字段 (使用混淆的参数名)
       const redirectInput = document.createElement('input');
       redirectInput.type = 'hidden';
-      redirectInput.name = 'redirect_path'; // Keep this name for server redirect logic
+      redirectInput.name = REDIRECT_PATH_PARAM;
       redirectInput.value = requestUrl.pathname + requestUrl.search;
       form.appendChild(redirectInput);
 
       const wayCodeInput = document.createElement('input');
       wayCodeInput.type = 'hidden';
-      wayCodeInput.name = PARAM_WAY_CODE; // Obfuscated name
-      wayCodeInput.id = 'wayCodeInput'; // Add ID for easy access
+      wayCodeInput.name = WAY_CODE_PARAM;
       wayCodeInput.value = wayCode;
       form.appendChild(wayCodeInput);
 
       const powNonceInput = document.createElement('input');
       powNonceInput.type = 'hidden';
-      powNonceInput.name = PARAM_POW_NONCE; // Obfuscated name
+      powNonceInput.name = POW_NONCE_PARAM;
       powNonceInput.id = 'powNonceInput'; // Add ID for easy access
       form.appendChild(powNonceInput);
 
+      // Add input for canvas/webgl support
+       const supportInput = document.createElement('input');
+       supportInput.type = 'hidden';
+       supportInput.name = CLIENT_SUPPORT_PARAM;
+       supportInput.id = 'clientSupportInput'; // Add ID for easy access
+       form.appendChild(supportInput);
+
+
+      // Add input for session cookie value
       const sessionCookieInput = document.createElement('input');
       sessionCookieInput.type = 'hidden';
-      sessionCookieInput.name = PARAM_SESSION_COOKIE_VALUE; // Obfuscated name
+      sessionCookieInput.name = SESSION_COOKIE_VALUE_PARAM;
       sessionCookieInput.id = 'sessionCookieInput'; // Add ID for easy access
       form.appendChild(sessionCookieInput);
 
-      const supportInput = document.createElement('input');
-      supportInput.type = 'hidden';
-      supportInput.name = PARAM_CLIENT_SUPPORT; // Obfuscated name
-      supportInput.id = 'clientSupportInput'; // Add ID for easy access
-      form.appendChild(supportInput);
 
-      // Fields for data integrity verification
-      const dataStringInput = document.createElement('input');
-      dataStringInput.type = 'hidden';
-      dataStringInput.name = PARAM_DATA_STRING; // Obfuscated name
-      dataStringInput.id = 'dataStringInput'; // Add ID for easy access
-      form.appendChild(dataStringInput);
-
-      const dataHashInput = document.createElement('input');
-      dataHashInput.type = 'hidden';
-      dataHashInput.name = PARAM_DATA_HASH; // Obfuscated name
-      dataHashInput.id = 'dataHashInput'; // Add ID for easy access
-      form.appendChild(dataHashInput);
-
-
-      // Add submit button (still hidden, triggered by JS)
+      // 添加提交按钮
       const submitBtn = document.createElement('button');
       submitBtn.id = 'submitBtn';
       submitBtn.type = 'submit';
@@ -796,15 +702,14 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
 
       jsContent.appendChild(form);
 
-      // Create waiting message
+      // 创建等待消息
       const waitingMessage = document.createElement('div');
       waitingMessage.id = 'waitingMessage';
       waitingMessage.className = 'waiting-message';
       waitingMessage.textContent = "Waiting for " + hostname + " to respond...";
-      waitingMessage.style.display = 'none'; // Initially hidden
       jsContent.appendChild(waitingMessage);
 
-      // Create additional text
+      // 创建附加文本
       const additionalText = document.createElement('div');
       additionalText.id = 'additionalText';
       additionalText.className = 'additional-text';
@@ -812,7 +717,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       jsContent.appendChild(additionalText);
     }
 
-    // Create footer
+    // 创建页脚
     function createFooter() {
       const footer = document.createElement('div');
       footer.className = 'footer';
@@ -830,7 +735,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       document.body.appendChild(footer);
     }
 
-    // Initialize verification flow
+    // 初始化验证流程
     async function initVerificationFlow() {
       // Check client capabilities (WebGL, Canvas)
       const support = checkClientSupport();
@@ -841,32 +746,43 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
        console.log("Client support:", support);
 
 
-      // Check if cookies are enabled
+      // 检查cookies是否启用
       if (!areCookiesEnabled()) {
         const statusText = document.getElementById('statusText');
         if (statusText) {
           statusText.textContent = 'Please enable cookies to continue.';
         }
-        hideTurnstile();
-        hideAdditionalText();
+
+        const turnstileContainer = document.querySelector('.cf-turnstile');
+        if (turnstileContainer) {
+          turnstileContainer.style.display = 'none';
+        }
+
+        const additionalText = document.getElementById('additionalText');
+        if (additionalText) {
+          additionalText.textContent = '';
+        }
+
         console.warn("Cookies are not enabled.");
         return;
       }
 
-      // Check for existing session cookie
+      // 检查是否存在会话cookie
       const existingSessionCookie = getCookie(COOKIE_NAME_SESSION);
       const sessionCookieInput = document.getElementById('sessionCookieInput');
 
       if (existingSessionCookie) {
         console.log("Existing session cookie found on client:", existingSessionCookie);
-        // Populate the hidden input with the existing session cookie
+
+        // 如果会话cookie已存在，添加到表单
         if (sessionCookieInput) {
-            sessionCookieInput.value = existingSessionCookie;
+             sessionCookieInput.value = existingSessionCookie;
         }
 
-        // Set cookie approach expiration refresh
+
+        // 设置cookie接近过期时刷新页面
         const sessionCookieLifetimeMs = SESSION_COOKIE_LIFETIME_MINUTES * 60 * 1000;
-        const refreshBeforeExpirationMs = 10 * 1000; // Refresh 10 seconds before expiration
+        const refreshBeforeExpirationMs = 10 * 1000;
 
         if (sessionCookieLifetimeMs > 0) {
           setTimeout(() => {
@@ -880,31 +796,31 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
              console.log("Proceeding with Turnstile verification.");
              // Turnstile script is already in the head and will auto-render
              // The onTurnstileSuccess callback will be called upon completion
-             // StatusText remains 'Verifying your connection.'
-             showTurnstile();
-             showAdditionalText();
+             const statusText = document.getElementById('statusText');
+             if (statusText) {
+               statusText.textContent = 'Verifying you are human. This may take a few seconds.';
+             }
          } else {
-             // If no Turnstile, and session cookie is valid, proceed with supplemental PoW if required
-             console.log("No Turnstile configured. Proceeding with supplemental PoW if required.");
-             if (powChallenge && powChallenge.type === 'supplemental') {
-                 await solveAndSubmitPoW(); // Solve supplemental PoW and then submit form
+             // If no Turnstile, and session cookie is valid, submit the form directly (or after PoW)
+             console.log("No Turnstile configured. Proceeding with direct submission (or PoW).");
+             if (powChallenge) {
+                 await solveAndSubmitPoW();
              } else {
-                 // If no Turnstile and no supplemental PoW required, submit directly (should not happen in typical flow)
-                 console.log("No Turnstile or supplemental PoW. Submitting directly.");
-                 submitVerificationForm();
+                  // Should not happen if no Turnstile, PoW should always be required
+                  console.error("Unexpected state: No Turnstile and no PoW challenge.");
+                   const statusText = document.getElementById('statusText');
+                   if (statusText) {
+                     statusText.innerText = 'An internal error occurred.';
+                   }
+                    setTimeout(() => { window.location.reload(); }, 5000);
              }
          }
 
+
       } else {
-        // No session cookie found, request a new one (requires initial PoW)
-        console.log("No existing session cookie found. Solving initial PoW to get session cookie.");
-         if (powChallenge && powChallenge.type === 'initial') {
-             // StatusText remains 'Verifying your connection.'
-             await solveAndFetchSessionCookie(wayCode, powChallenge);
-         } else {
-              console.error("Initial PoW challenge not provided.");
-              handleVerificationError('Verification error. Please try again.');
-         }
+        // 没有找到会话cookie，请求一个新的 (requires PoW)
+        console.log("No existing session cookie found. Solving PoW to get session cookie.");
+        await solveAndFetchSessionCookie(wayCode);
       }
     }
 
@@ -934,20 +850,32 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
     }
 
 
-    // Solve Initial PoW and then fetch session cookie
-    async function solveAndFetchSessionCookie(code, challenge) {
-        // StatusText remains 'Verifying your connection.'
-        hideTurnstile();
-        hideAdditionalText();
+    // Solve PoW and then fetch session cookie
+    async function solveAndFetchSessionCookie(code) {
+        const statusText = document.getElementById('statusText');
+        if (statusText) {
+           statusText.textContent = 'Verifying...'; // Simplified text
+        }
 
+        if (!powChallenge) {
+             console.error("PoW challenge not provided.");
+              if (statusText) {
+                statusText.textContent = 'Verification error: Missing challenge.';
+              }
+              // 5 seconds delay before refreshing
+              setTimeout(() => { window.location.reload(); }, 5000);
+             return;
+        }
 
-        console.log("Solving initial PoW challenge:", challenge);
+        console.log("Solving PoW challenge:", powChallenge);
         const startTime = Date.now();
-        const nonce = await solvePoW(challenge.target, challenge.difficulty, POW_NONCE_LENGTH);
+        const nonce = await solvePoW(powChallenge.target, powChallenge.difficulty, POW_NONCE_LENGTH);
         const endTime = Date.now();
-        console.log(\`Initial PoW solved in \${endTime - startTime} ms with nonce: \${nonce}\`);
+        console.log(\`PoW solved in \${endTime - startTime} ms with nonce: \${nonce}\`);
 
-        // StatusText remains 'Verifying your connection.'
+        if (statusText) {
+           statusText.textContent = 'Verifying...'; // Simplified text
+        }
 
         // Fetch session cookie with the solved PoW nonce and client support
         await fetchSessionCookie(code, nonce, checkClientSupport());
@@ -1000,16 +928,25 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
     }
 
 
-     // Solve Supplemental PoW and submit the form (used when Turnstile is not present or as supplemental)
+     // Solve PoW and submit the form (used when Turnstile is not present or as supplemental)
      async function solveAndSubmitPoW() {
-         // StatusText remains 'Verifying your connection.'
-         hideTurnstile();
-         hideAdditionalText();
+         const statusText = document.getElementById('statusText');
+         const turnstileContainer = document.querySelector('.cf-turnstile');
+         if (statusText) {
+            statusText.textContent = 'Verifying...'; // Simplified text
+         }
+         if (turnstileContainer) {
+             turnstileContainer.style.display = 'none'; // Hide Turnstile if showing PoW
+         }
 
 
-         if (!powChallenge || powChallenge.type !== 'supplemental') {
-              console.error("Supplemental PoW challenge not provided for submission.");
-               handleVerificationError('Verification error. Please try again.');
+         if (!powChallenge) {
+              console.error("PoW challenge not provided for submission.");
+               if (statusText) {
+                 statusText.textContent = 'Verification error: Missing challenge.';
+               }
+               // 5 seconds delay before refreshing
+               setTimeout(() => { window.location.reload(); }, 5000);
               return;
          }
 
@@ -1022,12 +959,18 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
          const powNonceInput = document.getElementById('powNonceInput');
          if (powNonceInput) {
              powNonceInput.value = nonce;
-             // StatusText remains 'Verifying your connection.'
+             if (statusText) {
+                statusText.textContent = 'Verifying...'; // Simplified text
+             }
               // Submit the form after solving PoW
              submitVerificationForm();
          } else {
              console.error("PoW nonce input field not found!");
-              handleVerificationError('An internal error occurred.');
+              if (statusText) {
+                statusText.innerText = 'An internal error occurred.';
+              }
+               // 5 seconds delay before refreshing
+               setTimeout(() => { window.location.reload(); }, 5000);
          }
      }
 
@@ -1056,7 +999,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       return null;
     }
 
-    // Set client cookie (used internally by fetchSessionCookie)
+    // Set client cookie
     function setCookieClient(name, value, minutes) {
       let expires = "";
       if (minutes) {
@@ -1067,33 +1010,27 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       document.cookie = name + "=" + (value || "") + expires + "; path=/; SameSite=Lax; Secure";
     }
 
-    // Fetch session cookie after solving Initial PoW
+    // Fetch session cookie after solving PoW
     async function fetchSessionCookie(code, powNonce, clientSupport) {
       try {
         const response = await fetch('/_firewayService/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-              way_code: code,
-              pow_nonce: powNonce,
-              client_support: clientSupport
-          })
+          body: JSON.stringify({ way_code: code, pow_nonce: powNonce, client_support: clientSupport }) // Send Way Code, PoW nonce, and client support
         });
 
         if (response.ok) {
           const data = await response.json();
           const sessionCookieValue = data.session_cookie;
-          if (sessionCookieValue) {
+          const sessionCookieInput = document.getElementById('sessionCookieInput');
+          if (sessionCookieValue && sessionCookieInput) {
             console.log("Session cookie fetched successfully.");
 
             // Store session cookie on client
             setCookieClient(COOKIE_NAME_SESSION, sessionCookieValue, SESSION_COOKIE_LIFETIME_MINUTES);
 
-            // Populate the session cookie input for the final submission
-            const sessionCookieInput = document.getElementById('sessionCookieInput');
-            if (sessionCookieInput) {
-                sessionCookieInput.value = sessionCookieValue;
-            }
+            // Add session cookie value to the form for the final /fireway/requestClear submission
+            sessionCookieInput.value = sessionCookieValue;
 
 
             // Set cookie approach expiration refresh
@@ -1107,135 +1044,111 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
               }, sessionCookieLifetimeMs - refreshBeforeExpirationMs);
             }
 
-             // Proceed to Turnstile verification if configured, or supplemental PoW
+             // Proceed to Turnstile verification if configured
              if (siteKey) {
                  console.log("Proceeding with Turnstile verification after getting session cookie.");
-                 // StatusText remains 'Verifying your connection.'
-                  showTurnstile();
-                  showAdditionalText();
-                 // Turnstile script will auto-render, onTurnstileSuccess will handle next step (supplemental PoW or submit)
-             } else {
-                 // If no Turnstile, and session cookie is valid, proceed with supplemental PoW if required
-                 console.log("No Turnstile configured. Proceeding with supplemental PoW if required.");
-                 if (powChallenge && powChallenge.type === 'supplemental') { // Use powChallenge from the initial page load
-                    await solveAndSubmitPoW(); // Solve PoW and then submit form
-                 } else {
-                    // If no Turnstile and no supplemental PoW required, submit directly
-                    console.log("No Turnstile or supplemental PoW. Submitting directly.");
-                    submitVerificationForm();
+                 const statusText = document.getElementById('statusText');
+                 if (statusText) {
+                   statusText.textContent = 'Verifying you are human. This may take a few seconds.';
                  }
+                 // Turnstile script will auto-render
+             } else {
+                 // If no Turnstile, and session cookie is valid, submit the form directly (or after supplemental PoW)
+                 console.log("No Turnstile configured. Proceeding with direct submission (or supplemental PoW).");
+                  if (powChallenge) { // Use powChallenge from the initial page load
+                     await solveAndSubmitPoW();
+                  } else {
+                      // Should not happen if no Turnstile, PoW should always be required
+                      console.error("Unexpected state: No Turnstile and no PoW challenge after fetching session cookie.");
+                       const statusText = document.getElementById('statusText');
+                       if (statusText) {
+                         statusText.innerText = 'An internal error occurred.';
+                       }
+                       setTimeout(() => { window.location.reload(); }, 5000);
+                  }
              }
 
 
           } else {
-            console.error("Failed to get session cookie value from response.");
-            handleVerificationError('Verification error. Please try again.');
+            console.error("Failed to get session cookie value from response or session cookie input not found.");
+
+            const statusText = document.getElementById('statusText');
+            if (statusText) {
+              statusText.textContent = 'Verification error. Please try again.';
+            }
+
+            const turnstileContainer = document.querySelector('.cf-turnstile');
+            if (turnstileContainer) {
+              turnstileContainer.style.display = 'none';
+            }
+             // 5 seconds delay before refreshing
+             setTimeout(() => { window.location.reload(); }, 5000);
           }
         } else {
           const errorText = await response.text();
           console.error('Failed to fetch session cookie:', response.status, errorText);
-          handleVerificationError('Verification error. Please try again.');
+
+          const statusText = document.getElementById('statusText');
+          if (statusText) {
+            statusText.textContent = 'Verification error. Please try again.';
+          }
+
+          const turnstileContainer = document.querySelector('.cf-turnstile');
+          if (turnstileContainer) {
+            turnstileContainer.style.display = 'none';
+          }
+
+          // 5 seconds delay before refreshing
+          setTimeout(() => { window.location.reload(); }, 5000);
         }
       } catch (error) {
         console.error('Error fetching session cookie:', error);
-         handleVerificationError('Verification error. Please try again.');
-      }
-    }
 
-    // Function to handle verification errors
-    function handleVerificationError(message) {
         const statusText = document.getElementById('statusText');
-        const successMessage = document.getElementById('successMessage');
-        const waitingMessage = document.getElementById('waitingMessage');
-
         if (statusText) {
-          statusText.textContent = message;
-          statusText.style.display = 'block';
+          statusText.textContent = 'Verification error. Please try again.';
         }
-        if (successMessage) successMessage.style.display = 'none';
-        if (waitingMessage) waitingMessage.style.display = 'none';
-        hideTurnstile();
-        hideAdditionalText();
+
+        const turnstileContainer = document.querySelector('.cf-turnstile');
+        if (turnstileContainer) {
+          turnstileContainer.style.display = 'none';
+        }
 
         // 5 seconds delay before refreshing
         setTimeout(() => { window.location.reload(); }, 5000);
+      }
     }
 
-
     // Function to submit the verification form
-    async function submitVerificationForm() {
+    function submitVerificationForm() {
         const verificationForm = document.getElementById('verificationForm');
         const waitingMessage = document.getElementById('waitingMessage');
         const successMessage = document.getElementById('successMessage');
         const statusText = document.getElementById('statusText');
+        const additionalText = document.getElementById('additionalText');
+        const turnstileContainer = document.querySelector('.cf-turnstile');
+
 
         if (verificationForm) {
-            // Before submitting, gather data and hash it using the public key
-            const wayCode = document.getElementById('wayCodeInput')?.value;
-            const sessionCookieValue = document.getElementById('sessionCookieInput')?.value;
-            const powNonce = document.getElementById('powNonceInput')?.value || ''; // PoW nonce might be empty if not required
-            const clientSupport = document.getElementById('clientSupportInput')?.value || ''; // JSON string
-            const redirectPath = verificationForm.querySelector('input[name="redirect_path"]')?.value || '';
-            const turnstileResponse = verificationForm.querySelector(\`input[name="\${PARAM_TURNSTILE_RESPONSE}"]\`)?.value || ''; // Turnstile response might be empty
+            // Hide initial status/turnstile, show success/waiting
+            if (statusText) statusText.style.display = 'none';
+            if (additionalText) additionalText.style.display = 'none';
+            if (turnstileContainer) turnstileContainer.style.display = 'none';
+            if (successMessage) successMessage.style.display = 'flex';
+            if (waitingMessage) waitingMessage.style.display = 'block';
 
-            // Data to hash: A consistent string representation of the important fields
-            // Order matters for hashing!
-            const dataToHashString = \`way_code=\${wayCode}&session=\${sessionCookieValue}&pow=\${powNonce}&support=\${clientSupport}&redirect=\${redirectPath}&turnstile=\${turnstileResponse}\`;
-
-            console.log("Data to hash:", dataToHashString);
-
-            if (!serverPublicKey) {
-                 console.error("Public key not loaded, cannot hash data.");
-                 handleVerificationError('Verification error. Security key not available.');
-                 return;
-            }
-
-            try {
-                const encoder = new TextEncoder();
-                const dataBuffer = encoder.encode(dataToHashString);
-
-                // Calculate the SHA-256 hash
-                const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
-                const hashArray = Array.from(new Uint8Array(hashBuffer));
-                const dataHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-                 console.log("Calculated data hash:", dataHash);
-
-                // Add the data string and its hash to the form
-                const dataStringInput = document.getElementById('dataStringInput');
-                const dataHashInput = document.getElementById('dataHashInput');
-
-                if (dataStringInput && dataHashInput) {
-                    dataStringInput.value = dataToHashString;
-                    dataHashInput.value = dataHash;
-                } else {
-                     console.error("Data string or hash input fields not found!");
-                     handleVerificationError('An internal error occurred.');
-                     return;
-                }
-
-
-                // Hide initial status/turnstile, show success/waiting
-                // StatusText remains 'Verifying your connection.'
-                hideAdditionalText();
-                hideTurnstile();
-                if (successMessage) successMessage.style.display = 'block'; // Show success message
-                if (waitingMessage) waitingMessage.style.display = 'block';
-
-                console.log("Submitting verification form with data and hash.");
-                // Submit the form
-                setTimeout(() => {
-                    verificationForm.submit();
-                }, 1000); // Delay submission slightly to show success state
-
-            } catch (error) {
-                 console.error('Error hashing data:', error);
-                 handleVerificationError('Verification error. Failed to process data.');
-            }
-
+            setTimeout(() => {
+                verificationForm.submit();
+            }, 1000); // Delay submission slightly to show success state
         } else {
              console.error("Verification form not found!");
-             handleVerificationError('An internal error occurred.');
+             if (statusText) {
+                statusText.innerText = 'An internal error occurred.';
+                statusText.style.display = 'block';
+             }
+             if (successMessage) successMessage.style.display = 'none';
+             if (waitingMessage) waitingMessage.style.display = 'none';
+             if (turnstileContainer) turnstileContainer.style.display = 'block';
         }
     }
 
@@ -1244,27 +1157,30 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
     function onTurnstileSuccess(token) {
       console.log("Turnstile success, preparing to submit form.");
 
-      // Add the Turnstile token to the form
+      // Add the Turnstile token to the form (using obfuscated name)
       const verificationForm = document.getElementById('verificationForm');
       if (verificationForm) {
-          // Find existing input or create a new one for the Turnstile token
-          let turnstileInput = verificationForm.querySelector(\`input[name="\${PARAM_TURNSTILE_RESPONSE}"]\`);
-          if (!turnstileInput) {
-              turnstileInput = document.createElement('input');
-              turnstileInput.type = 'hidden';
-              turnstileInput.name = PARAM_TURNSTILE_RESPONSE; // Obfuscated name
-              verificationForm.appendChild(turnstileInput);
-          }
+          const turnstileInput = document.createElement('input');
+          turnstileInput.type = 'hidden';
+          turnstileInput.name = TURNSTILE_RESPONSE_PARAM;
           turnstileInput.value = token;
+          verificationForm.appendChild(turnstileInput);
       } else {
           console.error("Verification form not found to add Turnstile token!");
-           handleVerificationError('Verification error. Please try again.');
+          // Handle error - maybe show an error message and refresh
+           const statusText = document.getElementById('statusText');
+           if (statusText) {
+             statusText.textContent = 'Verification error. Please try again.';
+             statusText.style.display = 'block';
+           }
+           // 5 seconds delay before refreshing
+           setTimeout(() => { window.location.reload(); }, 5000);
            return;
       }
 
 
       // Check if supplemental PoW is needed
-      if (powChallenge && powChallenge.type === 'supplemental') {
+      if (powChallenge) {
           console.log("Supplemental PoW required after Turnstile success.");
            solveAndSubmitPoW(); // Solve PoW and then submit form
       } else {
@@ -1275,41 +1191,45 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
 
     function onTurnstileError(error) {
       console.error("Turnstile error:", error);
-      handleVerificationError('Verification failed. Please try again.');
+
+      const statusText = document.getElementById('statusText');
+      const successMessage = document.getElementById('successMessage');
+      const waitingMessage = document.getElementById('waitingMessage');
+      const turnstileContainer = document.querySelector('.cf-turnstile');
+
+      if (statusText) {
+        statusText.innerText = 'Verification failed. Please try again.';
+        statusText.style.display = 'block';
+      }
+
+      if (successMessage) successMessage.style.display = 'none';
+      if (waitingMessage) waitingMessage.style.display = 'none';
+      if (turnstileContainer) turnstileContainer.style.display = 'block';
+
+      // 5 seconds delay before refreshing
+       setTimeout(() => { window.location.reload(); }, 5000);
     }
 
     function onTurnstileExpired() {
       console.log("Turnstile expired.");
-      handleVerificationError('Verification expired. Please try again.');
-    }
 
-    // Helper functions to show/hide elements
-    function hideTurnstile() {
-         const turnstileContainer = document.querySelector('.cf-turnstile');
-         if (turnstileContainer) {
-             turnstileContainer.style.display = 'none';
-         }
-    }
-    function showTurnstile() {
-         const turnstileContainer = document.querySelector('.cf-turnstile');
-         if (turnstileContainer) {
-             turnstileContainer.style.display = 'block';
-         }
-    }
-    function hideAdditionalText() {
-         const additionalText = document.getElementById('additionalText');
-         if (additionalText) {
-             additionalText.style.display = 'none';
-         }
-    }
-     function showAdditionalText() {
-         const additionalText = document.getElementById('additionalText');
-         if (additionalText) {
-             additionalText.style.display = 'block';
-         }
-    }
+      const statusText = document.getElementById('statusText');
+      const successMessage = document.getElementById('successMessage');
+      const waitingMessage = document.getElementById('waitingMessage');
+      const turnstileContainer = document.querySelector('.cf-turnstile');
 
+      if (statusText) {
+        statusText.innerText = 'Verification expired. Please try again.';
+        statusText.style.display = 'block';
+      }
 
+      if (successMessage) successMessage.style.display = 'none';
+      if (waitingMessage) waitingMessage.style.display = 'none';
+      if (turnstileContainer) turnstileContainer.style.display = 'block';
+
+      // 5 seconds delay before refreshing
+       setTimeout(() => { window.location.reload(); }, 5000);
+    }
   </script>
 </body>
 </html>
@@ -1901,6 +1821,263 @@ async function handleAdminConsole(req: Request, connInfo: Deno.ServeTlsInfo | De
             headers: { "Content-Type": "text/html; charset=utf-8" },
             status: 200
         });
+    } else if (adminPath === "/config/targetUrl") {
+         // Handle Target URL API
+         if (req.method === "GET") {
+             // Get target URL
+             const targetUrlKv = await kv.get(KV_PREFIX_TARGET_CDN_URL);
+             const currentTargetUrl = targetUrlKv.value !== null && typeof targetUrlKv.value === 'string' ? targetUrlKv.value : TARGET_CDN_URL_ENV; // Fallback to env if not in KV
+             return new Response(JSON.stringify({ targetUrl: currentTargetUrl }), {
+                 headers: { "Content-Type": "application/json" },
+                 status: 200
+             });
+         } else if (req.method === "POST") {
+             // Set target URL
+             try {
+                 const { targetUrl } = await req.json();
+                 if (typeof targetUrl === 'string' && targetUrl.trim() !== '') {
+                     const urlToSet = targetUrl.trim();
+                     // Basic URL validation
+                     try {
+                         new URL(urlToSet);
+                     } catch (e) {
+                         return new Response(`Invalid URL format: ${e.message}`, { status: 400 });
+                     }
+
+                     await kv.set(KV_PREFIX_TARGET_CDN_URL, urlToSet);
+                     TARGET_CDN_URL = urlToSet; // Update the global variable immediately
+                     console.log(`Proxy target URL updated to "${urlToSet}" by admin.`);
+                     return new Response("Target URL updated", { status: 200 });
+                 } else {
+                     return new Response("Invalid target URL provided", { status: 400 });
+                 }
+             } catch (e) {
+                 console.error("Error setting target URL:", e);
+                 return new Response("Error setting target URL", { status: 500 });
+             }
+         } else {
+             return new Response("Method Not Allowed", { status: 405 });
+         }
+    } else if (adminPath === "/blacklist") {
+        // Handle IP Blacklist API
+        if (req.method === "GET") {
+            // List blacklisted IPs
+            const entries = kv.list({ prefix: KV_PREFIX_IP_BLACKLIST });
+            const ips = [];
+            for await (const entry of entries) {
+                // The key is ["ip_blacklist", "ip_address"]
+                if (Array.isArray(entry.key) && entry.key.length === 2 && typeof entry.key[1] === 'string') {
+                     ips.push(entry.key[1]);
+                }
+            }
+            return new Response(JSON.stringify(ips), {
+                headers: { "Content-Type": "application/json" },
+                status: 200
+            });
+        } else if (req.method === "POST") {
+            // Add IP to blacklist
+            try {
+                const { ip } = await req.json();
+                if (typeof ip === 'string' && ip.trim() !== '') {
+                    const ipToBlacklist = ip.trim();
+                    // Basic validation (can be improved)
+                    // Allows IPv4, IPv6, and CIDR notations (simple check)
+                    if (!/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(\/\d{1,2})?)|([0-9a-fA-F:]+(\/\d{1,3})?)$/.test(ipToBlacklist)) {
+                         return new Response("Invalid IP or CIDR format", { status: 400 });
+                    }
+                    // Store the IP in KV. Value can be anything, like true or timestamp.
+                    await kv.set([...KV_PREFIX_IP_BLACKLIST, ipToBlacklist], true);
+                    console.log(`IP ${ipToBlacklist} added to blacklist by admin.`);
+                    return new Response("IP added", { status: 200 });
+                } else {
+                    return new Response("Invalid IP provided", { status: 400 });
+                }
+            } catch (e) {
+                console.error("Error adding IP to blacklist:", e);
+                return new Response("Error adding IP", { status: 500 });
+            }
+        } else if (req.method === "DELETE") {
+            // Remove IP from blacklist
+             try {
+                const { ip } = await req.json();
+                if (typeof ip === 'string' && ip.trim() !== '') {
+                    const ipToRemove = ip.trim();
+                    // Delete the key from KV
+                    await kv.delete([...KV_PREFIX_IP_BLACKLIST, ipToRemove]);
+                     console.log(`IP ${ipToRemove} removed from blacklist by admin.`);
+                    return new Response("IP removed", { status: 200 });
+                } else {
+                    return new Response("Invalid IP provided", { status: 400 });
+                }
+            } catch (e) {
+                console.error("Error removing IP from blacklist:", e);
+                return new Response("Error removing IP", { status: 500 });
+            }
+        } else {
+            return new Response("Method Not Allowed", { status: 405 });
+        }
+    } else if (adminPath === "/waf/rules") {
+         // Handle WAF Rules API
+         if (req.method === "GET") {
+             // List WAF rules
+             // WAF rules are stored as a single value in KV
+             const wafRulesKv = await kv.get(KV_PREFIX_WAF_RULES);
+             const rules = wafRulesKv.value !== null && Array.isArray(wafRulesKv.value) ? wafRulesKv.value : [];
+             return new Response(JSON.stringify(rules), {
+                 headers: { "Content-Type": "application/json" },
+                 status: 200
+             });
+         } else if (req.method === "POST") {
+             // Add WAF rule
+             try {
+                 const { rule } = await req.json();
+                 if (typeof rule === 'string' && rule.trim() !== '') {
+                     const ruleToAdd = rule.trim();
+                     // Get current rules, add the new one, save back to KV
+                     const wafRulesKv = await kv.get(KV_PREFIX_WAF_RULES);
+                     const currentRules = wafRulesKv.value !== null && Array.isArray(wafRulesKv.value) ? wafRulesKv.value as string[] : [];
+
+                     if (!currentRules.includes(ruleToAdd)) {
+                         currentRules.push(ruleToAdd);
+                         await kv.set(KV_PREFIX_WAF_RULES, currentRules);
+                         compileWafRules(); // Recompile rules immediately
+                         console.log(`WAF rule "${ruleToAdd}" added by admin.`);
+                     } else {
+                         console.log(`WAF rule "${ruleToAdd}" already exists.`);
+                     }
+
+                     return new Response("WAF rule added", { status: 200 });
+                 } else {
+                     return new Response("Invalid WAF rule provided", { status: 400 });
+                 }
+             } catch (e) {
+                 console.error("Error adding WAF rule:", e);
+                 return new Response("Error adding WAF rule", { status: 500 });
+             }
+         } else if (req.method === "DELETE") {
+             // Remove WAF rule
+              try {
+                 const { rule } = await req.json();
+                 if (typeof rule === 'string' && rule.trim() !== '') {
+                     const ruleToRemove = rule.trim();
+                     // Get current rules, filter out the one to remove, save back to KV
+                     const wafRulesKv = await kv.get(KV_PREFIX_WAF_RULES);
+                     const currentRules = wafRulesKv.value !== null && Array.isArray(wafRulesKv.value) ? wafRulesKv.value as string[] : [];
+
+                     const updatedRules = currentRules.filter(r => r !== ruleToRemove);
+
+                     if (updatedRules.length < currentRules.length) {
+                         await kv.set(KV_PREFIX_WAF_RULES, updatedRules);
+                         compileWafRules(); // Recompile rules immediately
+                         console.log(`WAF rule "${ruleToRemove}" removed by admin.`);
+                         return new Response("WAF rule removed", { status: 200 });
+                     } else {
+                         console.log(`WAF rule "${ruleToRemove}" not found.`);
+                         return new Response("WAF rule not found", { status: 404 });
+                     }
+
+                 } else {
+                     return new Response("Invalid WAF rule provided", { status: 400 });
+                 }
+             } catch (e) {
+                 console.error("Error removing WAF rule:", e);
+                 return new Response("Error removing WAF rule", { status: 500 });
+             }
+         } else {
+             return new Response("Method Not Allowed", { status: 405 });
+         }
+    } else if (adminPath === "/exempt/paths") {
+        // Handle Exempt Paths API
+        if (req.method === "GET") {
+            // List exempt paths
+            const exemptPathsKv = await kv.get(KV_PREFIX_EXEMPT_PATHS);
+            const paths = exemptPathsKv.value !== null && Array.isArray(exemptPathsKv.value) ? exemptPathsKv.value : [];
+            return new Response(JSON.stringify(paths), {
+                headers: { "Content-Type": "application/json" },
+                status: 200
+            });
+        } else if (req.method === "POST") {
+            // Add exempt path
+            try {
+                const { path } = await req.json();
+                if (typeof path === 'string' && path.trim() !== '') {
+                    const pathToAdd = path.trim();
+                    // Get current paths, add the new one, save back to KV
+                    const exemptPathsKv = await kv.get(KV_PREFIX_EXEMPT_PATHS);
+                    const currentPaths = exemptPathsKv.value !== null && Array.isArray(exemptPathsKv.value) ? exemptPathsKv.value as string[] : [];
+
+                    // Basic format validation for regex paths
+                    if (pathToAdd.startsWith("/^") && !pathToAdd.endsWith("$/")) {
+                        return new Response("Invalid regex path format: must end with '$/'", { status: 400 });
+                    } else if (!pathToAdd.startsWith("/^") && pathToAdd.endsWith("$/")) {
+                         return new Response("Invalid regex path format: must start with '/^'", { status: 400 });
+                    } else if (pathToAdd.startsWith("/^") && pathToAdd.endsWith("$/")) {
+                         // Validate regex itself
+                         try {
+                              new RegExp(pathToAdd.substring(2, pathToAdd.length - 2));
+                         } catch (e) {
+                             return new Response(`Invalid regex pattern: ${e.message}`, { status: 400 });
+                         }
+                    } else if (!pathToAdd.startsWith("/")) {
+                         return new Response("Invalid path format: must start with '/' or '/^'", { status: 400 });
+                    }
+
+
+                    if (!currentPaths.includes(pathToAdd)) {
+                        currentPaths.push(pathToAdd);
+                        await kv.set(KV_PREFIX_EXEMPT_PATHS, currentPaths);
+                        compileExemptPaths(); // Recompile paths immediately
+                        console.log(`Exempt path "${pathToAdd}" added by admin.`);
+                    } else {
+                        console.log(`Exempt path "${pathToAdd}" already exists.`);
+                    }
+
+                    return new Response("Exempt path added", { status: 200 });
+                } else {
+                    return new Response("Invalid exempt path provided", { status: 400 });
+                }
+            } catch (e) {
+                console.error("Error adding exempt path:", e);
+                return new Response("Error adding exempt path", { status: 500 });
+            }
+        } else if (req.method === "DELETE") {
+            // Remove exempt path
+             try {
+                const { path } = await req.json();
+                if (typeof path === 'string' && path.trim() !== '') {
+                    const pathToRemove = path.trim();
+                    // Get current paths, filter out the one to remove, save back to KV
+                    const exemptPathsKv = await kv.get(KV_PREFIX_EXEMPT_PATHS);
+                    const currentPaths = exemptPathsKv.value !== null && Array.isArray(exemptPathsKv.value) ? exemptPathsKv.value as string[] : [];
+
+                    const updatedPaths = currentPaths.filter(p => p !== pathToRemove);
+
+                     // Ensure Admin Console path is always exempt
+                     const adminConsolePath = "/_firewayService";
+                     if (!updatedPaths.includes(adminConsolePath)) {
+                         updatedPaths.push(adminConsolePath);
+                     }
+
+                    if (updatedPaths.length < currentPaths.length) {
+                        await kv.set(KV_PREFIX_EXEMPT_PATHS, updatedPaths);
+                        compileExemptPaths(); // Recompile paths immediately
+                        console.log(`Exempt path "${pathToRemove}" removed by admin.`);
+                        return new Response("Exempt path removed", { status: 200 });
+                    } else {
+                        console.log(`Exempt path "${pathToRemove}" not found.`);
+                        return new Response("Exempt path not found", { status: 404 });
+                    }
+
+                 } else {
+                     return new Response("Invalid exempt path provided", { status: 400 });
+                 }
+             } catch (e) {
+                 console.error("Error removing exempt path:", e);
+                 return new Response("Error removing exempt path", { status: 500 });
+             }
+         } else {
+             return new Response("Method Not Allowed", { status: 405 });
+         }
     }
 
 
@@ -1976,12 +2153,6 @@ async function loadConfigFromKv() {
             TARGET_CDN_URL = TARGET_CDN_URL_ENV; // Use env default if not in KV
         }
 
-         // Generate Public Key for data integrity verification on startup
-         publicCryptoKeyJWK = await generateAndExportPublicKey();
-         if (!publicCryptoKeyJWK) {
-             console.error("Failed to generate public key. Data integrity verification will be disabled.");
-         }
-
 
     } catch (e) {
         console.error("Error loading configuration from KV:", e);
@@ -1998,7 +2169,6 @@ async function loadConfigFromKv() {
         compileExemptPaths();
         // Fallback for Target CDN URL
         TARGET_CDN_URL = TARGET_CDN_URL_ENV;
-        // Public key generation failure is handled by the function
     }
 }
 
@@ -2028,7 +2198,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
             }
             if (typeof pow_nonce !== 'string' || pow_nonce.trim() === '') {
                  console.warn(`Missing or invalid PoW nonce in /_firewayService/session from IP ${clientIp}. Way Code: ${way_code}`);
-                 return new Response("Missing or invalid security check solution.", { status: 400 });
+                 return new Response("Missing or invalid PoW nonce.", { status: 400 });
             }
 
             // Retrieve the PoW challenge associated with this Way Code
@@ -2036,19 +2206,12 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
 
             if (powChallengeKvEntry.value === null) {
                  console.warn(`No active PoW challenge found for Way Code ${way_code} from IP ${clientIp}.`);
-                 return new Response("Invalid or expired challenge.", { status: 400 });
+                 return new Response("Invalid or expired Way Code/Challenge.", { status: 400 });
             }
 
-            const powChallenge = powChallengeKvEntry.value as { target: string, difficulty: number, type: 'initial' | 'supplemental' };
+            const powChallenge = powChallengeKvEntry.value as { target: string, difficulty: number };
 
-            // Verify the PoW solution (must be the initial PoW challenge)
-            if (powChallenge.type !== 'initial') {
-                 console.warn(`Incorrect PoW challenge type submitted for Way Code ${way_code} from IP ${clientIp}. Expected 'initial', got '${powChallenge.type}'.`);
-                 await kv.delete([...KV_PREFIX_WAY_CODE, way_code]);
-                 await kv.delete([...KV_PREFIX_POW_CHALLENGE, way_code]);
-                 return new Response("Invalid challenge type.", { status: 400 });
-            }
-
+             // Verify the PoW solution
              const isPowValid = await verifyPow(powChallenge.target, pow_nonce, powChallenge.difficulty);
 
              if (!isPowValid) {
@@ -2056,9 +2219,9 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
                   // Delete the used Way Code and PoW challenge on failure
                   await kv.delete([...KV_PREFIX_WAY_CODE, way_code]);
                   await kv.delete([...KV_PREFIX_POW_CHALLENGE, way_code]);
-                  return new Response("Invalid security check solution.", { status: 403 });
+                  return new Response("Invalid PoW solution.", { status: 403 });
              }
-             console.log(`Initial PoW solution valid for Way Code ${way_code} from IP ${clientIp}.`);
+             console.log(`PoW solution valid for Way Code ${way_code} from IP ${clientIp}.`);
 
 
             const wayCodeKvEntry = await kv.get([...KV_PREFIX_WAY_CODE, way_code]);
@@ -2123,7 +2286,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
                 await kv.delete([...KV_PREFIX_WAY_CODE, way_code]);
                 await kv.delete([...KV_PREFIX_POW_CHALLENGE, way_code]);
                 // Invalid Way Code or IP mismatch
-                return new Response("Invalid or expired challenge.", { status: 400 });
+                return new Response("Invalid or expired Way Code.", { status: 400 });
             }
         } catch (e) {
             console.error("Error handling session cookie request:", e);
@@ -2151,13 +2314,6 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
       // Continue processing if not the verification flow itself, but log the error.
       // The buildVerificationHtml function also handles this case by showing an error page.
   }
-
-  // Check if public key is loaded for verification
-   if (!publicCryptoKeyJWK) {
-        console.error("Public key is not loaded. Data integrity verification is disabled.");
-        // Depending on your security requirements, you might want to block requests here
-        // or proceed without verification (less secure). For now, we log and continue.
-   }
 
 
   const cookies = getCookies(req.headers);
@@ -2207,17 +2363,12 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
   if (url.pathname === "/fireway/requestClear" && req.method === "POST") {
     const formData = await req.formData();
     // Use obfuscated parameter names
-    const wayCode = formData.get(PARAM_WAY_CODE)?.toString();
-    const turnstileToken = formData.get(PARAM_TURNSTILE_RESPONSE)?.toString();
-    const submittedSessionCookie = formData.get(PARAM_SESSION_COOKIE_VALUE)?.toString();
-    const powNonce = formData.get(PARAM_POW_NONCE)?.toString();
-    const clientSupportStr = formData.get(PARAM_CLIENT_SUPPORT)?.toString();
-    const dataString = formData.get(PARAM_DATA_STRING)?.toString(); // Get the data string
-    const dataHash = formData.get(PARAM_DATA_HASH)?.toString(); // Get the data hash
-
-
-    // Keep redirect_path as is for server-side redirection
-    const redirectPath = formData.get('redirect_path')?.toString() || "/";
+    const turnstileToken = formData.get('d')?.toString();
+    const redirectPath = formData.get('e')?.toString() || "/";
+    const wayCode = formData.get('a')?.toString(); // Get Way Code
+    const submittedSessionCookie = formData.get('f')?.toString(); // Get session cookie value from form
+    const powNonce = formData.get('b')?.toString(); // Get supplemental PoW nonce
+    const clientSupportStr = formData.get('c')?.toString();
     const clientSupport = clientSupportStr ? JSON.parse(clientSupportStr) : {};
 
 
@@ -2230,76 +2381,50 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
          return new Response("Verification error: Missing session state.", { status: 400 });
      }
 
-    // --- Data Integrity Verification ---
-    let isDataIntegrityValid = true; // Assume valid if verification is disabled
-    if (publicCryptoKeyJWK) { // Only attempt verification if public key was generated
-        if (!dataString || !dataHash) {
-             console.warn(`Missing data string or hash in verification request from IP ${clientIp}.`);
-             isDataIntegrityValid = false; // Treat as invalid if data for verification is missing
-        } else {
-             try {
-                 const encoder = new TextEncoder();
-                 const dataBuffer = encoder.encode(dataString);
-
-                 // Re-calculate the hash on the server side
-                 const serverHashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
-                 const serverHashArray = Array.from(new Uint8Array(serverHashBuffer));
-                 const serverDataHash = serverHashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-                 // Compare server-calculated hash with client-provided hash
-                 if (serverDataHash !== dataHash) {
-                     console.warn(`Data integrity check failed for IP ${clientIp}. Client hash: "${dataHash}", Server hash: "${serverDataHash}". Data string: "${dataString}"`);
-                     isDataIntegrityValid = false;
-                 } else {
-                     console.log(`Data integrity check successful for IP ${clientIp}.`);
-                 }
-             } catch (e) {
-                 console.error("Error performing data integrity check:", e);
-                 isDataIntegrityValid = false; // Verification failed due to error
-             }
-        }
-    }
-
-     if (!isDataIntegrityValid) {
-          console.warn(`Verification failed for IP ${clientIp} due to invalid or missing data integrity.`);
-          return new Response("Verification failed: Data integrity check failed.", { status: 403 });
-     }
-
-
-    // Verify the submitted session cookie
-    // We need to check if this session cookie is valid AND associated with this IP in KV
-    const sessionKvEntry = await kv.get([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
-
-    if (sessionKvEntry.value === null || sessionKvEntry.value !== clientIp) {
-         console.warn(`Invalid, expired, or IP mismatch session cookie submitted for IP ${clientIp} during /fireway/requestClear. Re-initiating verification.`);
-         // If session cookie is invalid/expired, restart the verification process
-         // Do not issue the clear cookie, return the verification page, issue a new Way Code.
-         // The client JS will detect the missing/invalid session cookie and request a new one.
-         // Delete the invalid session cookie from KV if it existed
-          if (submittedSessionCookie && sessionKvEntry.value !== null) { // Only delete if the cookie was sent and found in KV (but IP didn't match)
-              await kv.delete([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
-          }
-         return new Response("Verification failed. Session expired or invalid. Please try again.", { status: 403 });
-    }
-     console.log(`Session cookie validation successful for IP ${clientIp}.`);
-
-
-    // Determine required supplemental PoW difficulty based on client support and Turnstile configuration
+    // Determine required supplemental PoW difficulty based on client support
     let requiredSupplementalPowDifficulty = 0;
-    if (!CF_TURNSTILE_SITE_KEY) {
-         // If no Turnstile, always require Medium PoW for final verification
-        requiredSupplementalPowDifficulty = POW_DIFFICULTY_MEDIUM;
-    } else if (!clientSupport.webgl && !clientSupport.canvas) {
-        // If Turnstile is configured but client has no canvas/webgl, require Hard PoW
+    if (!clientSupport.webgl && !clientSupport.canvas) {
         requiredSupplementalPowDifficulty = POW_DIFFICULTY_HARD;
     } else if (!clientSupport.webgl || !clientSupport.canvas) {
-        // If Turnstile is configured but client has only one (canvas or webgl), require Medium PoW
         requiredSupplementalPowDifficulty = POW_DIFFICULTY_MEDIUM;
     }
-    // If Turnstile is configured AND client has both canvas and webgl, no supplemental PoW is required here.
+    // Low difficulty PoW is only for initial session cookie request
+
+    // Verify supplemental PoW if required
+    let isSupplementalPowValid = true; // Assume valid if not required
+    if (requiredSupplementalPowDifficulty > 0) {
+        if (!powNonce) {
+             console.warn(`Missing required supplemental PoW nonce for IP ${clientIp}. Required difficulty: ${requiredSupplementalPowDifficulty}`);
+             return new Response("Missing required security challenge solution.", { status: 400 });
+        }
+        // Retrieve the PoW challenge associated with this Way Code
+        const powChallengeKvEntry = await kv.get([...KV_PREFIX_POW_CHALLENGE, wayCode]);
+
+        if (powChallengeKvEntry.value === null) {
+             console.warn(`No active PoW challenge found for Way Code ${wayCode} during /fireway/requestClear from IP ${clientIp}.`);
+             return new Response("Invalid or expired Way Code/Challenge.", { status: 400 });
+        }
+
+        const powChallenge = powChallengeKvEntry.value as { target: string, difficulty: number };
+
+        // Verify the PoW solution using the expected difficulty
+        isSupplementalPowValid = await verifyPow(powChallenge.target, powNonce, requiredSupplementalPowDifficulty);
+
+        if (!isSupplementalPowValid) {
+             console.warn(`Invalid supplemental PoW solution submitted for Way Code ${wayCode} from IP ${clientIp}.`);
+             // Delete the used Way Code and PoW challenge on failure
+             await kv.delete([...KV_PREFIX_WAY_CODE, wayCode]);
+             await kv.delete([...KV_PREFIX_POW_CHALLENGE, wayCode]);
+             return new Response("Invalid security challenge solution.", { status: 403 });
+        }
+        console.log(`Supplemental PoW solution valid for Way Code ${wayCode} from IP ${clientIp}.`);
+
+         // Delete the used PoW challenge after successful verification
+         await kv.delete([...KV_PREFIX_POW_CHALLENGE, wayCode]);
+    }
 
 
-    // Verify Turnstile Token (if configured and token is present)
+    // 1. Verify Turnstile Token (if configured and token is present)
     let isTurnstileHuman = !CF_TURNSTILE_SITE_KEY || !turnstileToken; // Assume human if no Turnstile key or token
 
     if (CF_TURNSTILE_SITE_KEY && turnstileToken) {
@@ -2311,108 +2436,76 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
          }
     }
 
-    // Verify supplemental PoW if required
-    let isSupplementalPowValid = true; // Assume valid if not required
-    if (requiredSupplementalPowDifficulty > 0) {
-        if (!powNonce) {
-             console.warn(`Missing required supplemental PoW nonce for IP ${clientIp}. Required difficulty: ${requiredSupplementalPowDifficulty}`);
-             return new Response("Missing required security check solution.", { status: 400 });
-        }
-        // Retrieve the PoW challenge associated with this Way Code
-        const powChallengeKvEntry = await kv.get([...KV_PREFIX_POW_CHALLENGE, wayCode]);
-
-        if (powChallengeKvEntry.value === null) {
-             console.warn(`No active supplemental PoW challenge found for Way Code ${wayCode} during /fireway/requestClear from IP ${clientIp}.`);
-             return new Response("Invalid or expired challenge.", { status: 400 });
-        }
-
-        const powChallenge = powChallengeKvEntry.value as { target: string, difficulty: number, type: 'initial' | 'supplemental' };
-
-        // Verify the PoW solution using the expected difficulty (must be supplemental PoW)
-         if (powChallenge.type !== 'supplemental' || powChallenge.difficulty !== requiredSupplementalPowDifficulty) {
-              console.warn(`Incorrect PoW challenge type or difficulty submitted for Way Code ${wayCode} from IP ${clientIp}. Expected type 'supplemental' with difficulty ${requiredSupplementalPowDifficulty}, got type '${powChallenge.type}' with difficulty ${powChallenge.difficulty}.`);
-              await kv.delete([...KV_PREFIX_WAY_CODE, wayCode]);
-              await kv.delete([...KV_PREFIX_POW_CHALLENGE, wayCode]);
-              return new Response("Invalid challenge type or difficulty.", { status: 400 });
-         }
-
-        isSupplementalPowValid = await verifyPow(powChallenge.target, powNonce, requiredSupplementalPowDifficulty);
-
-        if (!isSupplementalPowValid) {
-             console.warn(`Invalid supplemental PoW solution submitted for Way Code ${wayCode} from IP ${clientIp}.`);
-             // Delete the used Way Code and PoW challenge on failure
-             await kv.delete([...KV_PREFIX_WAY_CODE, wayCode]);
-             await kv.delete([...KV_PREFIX_POW_CHALLENGE, wayCode]);
-             return new Response("Invalid security check solution.", { status: 403 });
-        }
-        console.log(`Supplemental PoW solution valid for Way Code ${wayCode} from IP ${clientIp}.`);
-
-         // Delete the used PoW challenge after successful verification
-         await kv.delete([...KV_PREFIX_POW_CHALLENGE, wayCode]);
-    }
-
-
-     // Final verification decision: Pass if Session is valid AND Data Integrity is valid AND (Turnstile passes OR Supplemental PoW passes)
-     const isVerificationSuccessful = sessionKvEntry.value === clientIp && isDataIntegrityValid && (isTurnstileHuman || (requiredSupplementalPowDifficulty > 0 && isSupplementalPowValid));
+     // Verification is successful if EITHER Turnstile passes OR supplemental PoW (if required) passes.
+     const isVerificationSuccessful = isTurnstileHuman || (requiredSupplementalPowDifficulty > 0 && isSupplementalPowValid);
 
 
     if (isVerificationSuccessful) {
-       console.log(`Verification successful for IP ${clientIp}. Issuing clear cookie.`);
+       console.log(`Verification successful for IP ${clientIp}.`);
 
-       // 3. Issue the du_clear cookie
-       // Use the Way Code obtained from the form as the clear cookie value
-       const newClearCookieValue = wayCode; // Re-using wayCode as clear cookie value
-       const clearExpirationDate = new Date(Date.now() + COOKIE_LIFETIME_MINUTES * 60 * 1000);
+       // 2. Verify the submitted session cookie
+       // We need to check if this session cookie is valid AND associated with this IP in KV
+       const sessionKvEntry = await kv.get([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
 
-       // Store the clear cookie value in Deno KV, bound to the IP, with expiration
-       await kv.set([...KV_PREFIX_CLEAR_COOKIE, newClearCookieValue], clientIp, { expireIn: COOKIE_LIFETIME_MINUTES * 60 * 1000 });
+       if (sessionKvEntry.value !== null && sessionKvEntry.value === clientIp) {
+           console.log(`Session cookie validation successful for IP ${clientIp}. Issuing clear cookie.`);
+           // 3. Issue the du_clear cookie
+           // Use the Way Code obtained from the form as the clear cookie value
+           const newClearCookieValue = wayCode; // Re-using wayCode as clear cookie value
+           const clearExpirationDate = new Date(Date.now() + COOKIE_LIFETIME_MINUTES * 60 * 1000);
 
-       // Delete the session cookie record as it's no longer needed
-       await kv.delete([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
-       // Also delete the Way Code record as it's no longer needed
-       await kv.delete([...KV_PREFIX_WAY_CODE, wayCode]);
+           // Store the clear cookie value in Deno KV, bound to the IP, with expiration
+           await kv.set([...KV_PREFIX_CLEAR_COOKIE, newClearCookieValue], clientIp, { expireIn: COOKIE_LIFETIME_MINUTES * 60 * 1000 });
+
+           // Delete the session cookie record as it's no longer needed
+           await kv.delete([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
+
+           const headers = new Headers();
+           headers.set("Location", new URL(redirectPath, url.origin).toString());
+           setCookie(headers, {
+             name: COOKIE_NAME_CLEAR,
+             value: newClearCookieValue, // Use Way Code
+             expires: clearExpirationDate,
+             path: "/", // Cookie is valid for the entire site
+             httpOnly: true, // Prevent JavaScript access
+             secure: url.protocol === "https:", // Only send over HTTPS
+             sameSite: "Lax", // Appropriate SameSite policy
+           });
+
+           // Also delete the session cookie from the client by setting an expired one
+            setCookie(headers, {
+                name: COOKIE_NAME_SESSION,
+                value: '', // Set empty value
+                expires: new Date(0), // Set expiration to a past date
+                path: "/",
+                httpOnly: true,
+                secure: url.protocol === "https:",
+                sameSite: "Lax",
+            });
 
 
-       const headers = new Headers();
-       headers.set("Location", new URL(redirectPath, url.origin).toString());
-       setCookie(headers, {
-         name: COOKIE_NAME_CLEAR,
-         value: newClearCookieValue, // Use Way Code
-         expires: clearExpirationDate,
-         path: "/", // Cookie is valid for the entire site
-         httpOnly: true, // Prevent JavaScript access
-         secure: url.protocol === "https:", // Only send over HTTPS
-         sameSite: "Lax", // Appropriate SameSite policy
-       });
+           const response = new Response(null, {
+               status: 302,
+               headers: headers,
+           });
 
-       // Also delete the session cookie from the client by setting an expired one
-        setCookie(headers, {
-            name: COOKIE_NAME_SESSION,
-            value: '', // Set empty value
-            expires: new Date(0), // Set expiration to a past date
-            path: "/",
-            httpOnly: true,
-            secure: url.protocol === "https:",
-            sameSite: "Lax",
-        });
+           return response;
 
+       } else {
+           console.warn(`Invalid, expired, or IP mismatch session cookie submitted for IP ${clientIp} during /fireway/requestClear. Re-initiating verification.`);
+           // If session cookie is invalid/expired, restart the verification process
+           // Do not issue the clear cookie, return the verification page, issue a new Way Code.
+           // The client JS will detect the missing/invalid session cookie and request a new one.
+           // Delete the invalid session cookie from KV if it existed
+            if (submittedSessionCookie && sessionKvEntry.value !== null) { // Only delete if the cookie was sent and found in KV (but IP didn't match)
+                await kv.delete([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
+            }
+           return new Response("Verification failed. Session expired or invalid. Please try again.", { status: 403 });
+       }
 
-       const response = new Response(null, {
-           status: 302,
-           headers: headers,
-       });
-
-       return response;
 
     } else {
-      console.log(`Verification failed for IP ${clientIp}. Re-initiating verification.`);
-      // If verification failed (e.g., Turnstile failed, supplemental PoW failed, data integrity failed),
-      // delete the session cookie and Way Code, and return a failure response.
-      // The client will need to start the process over.
-       await kv.delete([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
-       await kv.delete([...KV_PREFIX_WAY_CODE, wayCode]);
-       // The PoW challenge was already deleted after verification attempt (success or failure)
-
+      console.log(`Verification failed for IP ${clientIp}. Turnstile: ${CF_TURNSTILE_SITE_KEY && turnstileToken ? isTurnstileHuman : 'N/A'}, Supplemental PoW: ${requiredSupplementalPowDifficulty > 0 ? isSupplementalPowValid : 'N/A'}`);
       return new Response("Verification failed. Please try again.", { status: 403 });
     }
   }
@@ -2455,10 +2548,9 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
       console.log(`Valid clear cookie found for IP ${clientIp}: ${clearCookie}`);
     } else {
       console.log(`Invalid, expired, or IP mismatch clear cookie found for IP ${clientIp}: ${clearCookie}. Deleting.`);
-       // If clear cookie is invalid, delete it from KV
-       if (clearCookie) { // Only attempt to delete if the cookie was actually sent
-           await kv.delete([...KV_PREFIX_CLEAR_COOKIE, clearCookie]);
-       }
+       // If clear cookie is invalid, delete it from the client
+       // We can't set the cookie header here as we might return the verification page.
+       // We'll handle clearing the cookie when building the verification page response.
     }
   }
 
@@ -2492,7 +2584,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
 
          // Generate initial PoW challenge (low difficulty)
          const powTarget = await generatePowTarget(newWayCode);
-         const initialPowChallenge = { target: powTarget, difficulty: POW_DIFFICULTY_LOW, type: 'initial' as const };
+         const initialPowChallenge = { target: powTarget, difficulty: POW_DIFFICULTY_LOW };
 
          // Store the Way Code and PoW challenge in KV, associated with the IP, with a short expiry
          // The Way Code and initial PoW are valid only for the initial session cookie request
@@ -2500,7 +2592,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
          await kv.set([...KV_PREFIX_POW_CHALLENGE, newWayCode], initialPowChallenge, { expireIn: 5 * 60 * 1000 }); // PoW challenge expires with Way Code
 
 
-         const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, publicCryptoKeyJWK, initialPowChallenge); // Pass the new Way Code, Public Key JWK, and PoW challenge
+         const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, initialPowChallenge); // Pass the new Way Code and PoW challenge
 
          const response = new Response(verificationHtml, {
            headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -2543,27 +2635,33 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
         // We should return the verification page again. The client JS will use the existing session cookie.
         console.log(`Valid session cookie exists for IP ${clientIp}. Returning verification page.`);
 
-        // We need a new Way Code for the /fireway/requestClear submission.
+        // We need a new Way Code and potentially a new supplemental PoW challenge
         const newWayCode = crypto.randomUUID(); // Use crypto.randomUUID()
 
-        // Determine if a supplemental PoW is required based on Turnstile config.
+        // We need client support info to determine supplemental PoW difficulty.
+        // Since we don't have it on the initial request to the verification page,
+        // we'll rely on the client sending it back in the /fireway/requestClear request.
+        // For the verification page itself, we don't need to issue a *new* PoW challenge here
+        // unless Turnstile is not configured. The client will solve the initial low-difficulty
+        // PoW to get the session cookie, and then potentially a supplemental one for /fireway/requestClear.
+
         let supplementalPowChallenge = undefined;
+        // If Turnstile is NOT configured, we require a supplemental PoW on /fireway/requestClear.
+        // We'll issue a MEDIUM difficulty challenge here for the client to solve *after* getting the session cookie.
+        // The client JS will detect the lack of Turnstile and solve this PoW before submitting /fireway/requestClear.
          if (!CF_TURNSTILE_SITE_KEY) {
-             // If Turnstile is NOT configured, we require a supplemental PoW on /fireway/requestClear.
-             // Issue a MEDIUM difficulty challenge here.
              const powTarget = await generatePowTarget(newWayCode);
-             supplementalPowChallenge = { target: powTarget, difficulty: POW_DIFFICULTY_MEDIUM, type: 'supplemental' as const };
+             supplementalPowChallenge = { target: powTarget, difficulty: POW_DIFFICULTY_MEDIUM };
              await kv.set([...KV_PREFIX_POW_CHALLENGE, newWayCode], supplementalPowChallenge, { expireIn: 5 * 60 * 1000 }); // Supplemental PoW expires with Way Code
              console.log(`Issuing supplemental PoW challenge (Medium) for IP ${clientIp} as Turnstile is not configured.`);
          } else {
               // If Turnstile is configured, we still need a Way Code for the /fireway/requestClear submission.
-              // Supplemental PoW (Medium or Hard, based on client support) will be determined and required
-              // by the /fireway/requestClear endpoint itself. We don't issue that challenge here.
+              // Supplemental PoW (Medium or Hard) will be determined and required based on client support in /fireway/requestClear.
               await kv.set([...KV_PREFIX_WAY_CODE, newWayCode], clientIp, { expireIn: 5 * 60 * 1000 }); // Way Code expires in 5 minutes
          }
 
 
-        const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, publicCryptoKeyJWK, supplementalPowChallenge); // Pass the new Way Code, Public Key JWK, and potential supplemental PoW
+        const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, supplementalPowChallenge); // Pass the new Way Code and potential supplemental PoW
 
          const response = new Response(verificationHtml, {
            headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -2646,16 +2744,10 @@ if (ADMIN_PASSWORD_HASH === DEFAULT_ADMIN_PASSWORD_HASH) {
 if (!CF_TURNSTILE_SITE_KEY || !CF_TURNSTILE_SECRET_KEY) {
     console.warn("WARNING: Cloudflare Turnstile keys (CF_TURNSTILE_SITE_KEY, CF_TURNSTILE_SECRET_KEY) are not set. Verification will rely heavily on PoW.");
 }
-if (!publicCryptoKeyJWK) {
-     console.error("ERROR: Public key failed to generate on startup. Data integrity verification for /fireway/requestClear is disabled. This significantly reduces security against tampering.");
-}
 await serve(handler, { port: LISTEN_PORT });
+
 
 // Uncomment and run this section once to generate your password hash
 // console.log("Generating SHA-256 hash for 'mysecretpassword123':");
 // console.log(await generateSha256Hash("mysecretpassword123"));
 // Then set the output as ADMIN_PASSWORD_HASH environment variable.
-
-// Note: The private key is now only needed if you want to implement server-to-client signing,
-// which is not required for client data integrity verification.
-// You no longer need to generate and set PRIVATE_KEY_PEM for this specific data integrity check.
