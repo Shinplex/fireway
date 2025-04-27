@@ -43,9 +43,9 @@ const ADMIN_USERNAME = Deno.env.get("ADMIN_USERNAME") || "admin";
 const DEFAULT_ADMIN_PASSWORD_HASH = "d82494f05d6917ba02f7aaa29689ccb444bb73f20380876cb05d1f37537b7892"; // hash of "adminadmin"
 const ADMIN_PASSWORD_HASH = Deno.env.get("ADMIN_PASSWORD_HASH") || DEFAULT_ADMIN_PASSWORD_HASH;
 
-// Private Key for signing (PEM format, from environment variable)
-const PRIVATE_KEY_PEM = Deno.env.get("PRIVATE_KEY_PEM");
-let privateCryptoKey: CryptoKey | undefined;
+// Public Key for data integrity verification (JWK format, generated on startup)
+let publicCryptoKeyJWK: JsonWebKey | undefined;
+
 
 // Session Cookie 限制 (每个 IP 最多同时拥有的 Session Cookie 数量)
 const MAX_SESSION_COOKIES_PER_IP = parseInt(Deno.env.get("MAX_SESSION_COOKIES_PER_IP") || "2", 10); // Default 2
@@ -63,7 +63,8 @@ const PARAM_TURNSTILE_RESPONSE = "t";
 const PARAM_SESSION_COOKIE_VALUE = "s";
 const PARAM_POW_NONCE = "p";
 const PARAM_CLIENT_SUPPORT = "c";
-const PARAM_SIGNATURE = "sig"; // Parameter for the digital signature
+const PARAM_DATA_STRING = "d"; // Parameter for the data string to verify
+const PARAM_DATA_HASH = "h"; // Parameter for the hash of the data string
 
 
 // --- WAF 配置 ---
@@ -322,63 +323,25 @@ async function verifyPow(target: string, nonce: string, difficulty: number): Pro
     return hash.startsWith(requiredPrefix);
 }
 
-// Import the private key from PEM format
-async function importPrivateKey(pem: string): Promise<CryptoKey | undefined> {
+// Generate RSA Key Pair and export Public Key as JWK
+async function generateAndExportPublicKey(): Promise<JsonWebKey | undefined> {
     try {
-        // Remove PEM header and footer
-        const base64 = pem
-            .replace(/-----BEGIN PRIVATE KEY-----/g, '')
-            .replace(/-----END PRIVATE KEY-----/g, '')
-            .replace(/\s+/g, ''); // Remove whitespace
-
-        const binaryDer = decodeBase64(base64);
-
-        // Import the key
-        const key = await crypto.subtle.importKey(
-            "pkcs8", // Format of the key (e.g., PKCS#8)
-            binaryDer,
-            {
-                name: "RSASSA-PKCS1-v1_5", // Algorithm name
-                hash: "SHA-256",           // Hash algorithm
-            },
-            false, // Not exportable
-            ["sign"] // Can be used for signing
-        );
-        console.log("Private key imported successfully.");
-        return key;
-    } catch (e) {
-        console.error("Error importing private key:", e);
-        return undefined;
-    }
-}
-
-// Sign data using the imported private key
-async function signData(data: string): Promise<string | undefined> {
-    if (!privateCryptoKey) {
-        console.error("Private key not loaded for signing.");
-        return undefined;
-    }
-    try {
-        const encoder = new TextEncoder();
-        const dataBuffer = encoder.encode(data);
-
-        const signatureBuffer = await crypto.subtle.sign(
+        const keyPair = await crypto.subtle.generateKey(
             {
                 name: "RSASSA-PKCS1-v1_5",
+                modulusLength: 2048, // Can be 2048, 4096, etc.
+                publicExponent: new Uint8Array([1, 0, 1]), // 65537
                 hash: "SHA-256",
             },
-            privateCryptoKey,
-            dataBuffer
+            false, // Not exportable (private key) - we only need the public key for verification
+            ["verify"] // Can be used for verification
         );
 
-        // Encode the signature as Base64Url (safe for URLs)
-        // Deno's base64 encoding is not Base64Url by default, need manual replacement
-        const signatureBase64 = encodeBase64(signatureBuffer);
-        const signatureBase64Url = signatureBase64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-
-        return signatureBase64Url;
+        const publicKeyJwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+        console.log("Generated and exported public key (JWK).");
+        return publicKeyJwk;
     } catch (e) {
-        console.error("Error signing data:", e);
+        console.error("Error generating or exporting key pair:", e);
         return undefined;
     }
 }
@@ -439,7 +402,7 @@ function getClientIp(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHttpI
 }
 
 // Build verification page HTML (simulating Cloudflare layout with dark/light mode, left align)
-function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hostname: string, wayCode: string, powChallenge?: { target: string, difficulty: number, type: 'initial' | 'supplemental' }): string {
+function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hostname: string, wayCode: string, publicKeyJwk: JsonWebKey | undefined, powChallenge?: { target: string, difficulty: number, type: 'initial' | 'supplemental' }): string {
   // Check if Site Key is set
   if (!siteKey || siteKey === "YOUR_TURNSTILE_SITE_KEY") {
       return `
@@ -481,6 +444,10 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
         </html>
       `;
   }
+
+  // Embed the public key as a JSON string
+  const publicKeyJwkString = publicKeyJwk ? JSON.stringify(publicKeyJwk) : 'null';
+
 
   return `
 <!DOCTYPE html>
@@ -668,13 +635,19 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
     const powChallenge = ${powChallenge ? JSON.stringify(powChallenge) : 'null'};
     const POW_NONCE_LENGTH = ${POW_NONCE_LENGTH};
 
+    // Server Public Key (JWK format)
+    const serverPublicKeyJwk = ${publicKeyJwkString};
+    let serverPublicKey = null; // Will store the imported CryptoKey
+
+
      // Obfuscated Parameter Names
     const PARAM_WAY_CODE = "${PARAM_WAY_CODE}";
     const PARAM_TURNSTILE_RESPONSE = "${PARAM_TURNSTILE_RESPONSE}";
     const PARAM_SESSION_COOKIE_VALUE = "${PARAM_SESSION_COOKIE_VALUE}";
     const PARAM_POW_NONCE = "${PARAM_POW_NONCE}";
     const PARAM_CLIENT_SUPPORT = "${PARAM_CLIENT_SUPPORT}";
-    const PARAM_SIGNATURE = "${PARAM_SIGNATURE}";
+    const PARAM_DATA_STRING = "${PARAM_DATA_STRING}";
+    const PARAM_DATA_HASH = "${PARAM_DATA_HASH}";
 
 
     // 在DOM加载完成后执行
@@ -685,9 +658,39 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       // 添加页脚
       createFooter();
 
-      // 初始化验证流程
-      initVerificationFlow();
+      // 导入公钥并初始化验证流程
+      importPublicKey().then(() => {
+          initVerificationFlow();
+      }).catch(e => {
+           console.error("Failed to import public key:", e);
+           handleVerificationError('Verification error. Failed to load security key.');
+      });
     });
+
+    // Import the public key from JWK format
+    async function importPublicKey() {
+        if (!serverPublicKeyJwk) {
+            console.warn("Server public key not provided.");
+            return;
+        }
+        try {
+            serverPublicKey = await crypto.subtle.importKey(
+                "jwk",
+                serverPublicKeyJwk,
+                {
+                    name: "RSASSA-PKCS1-v1_5",
+                    hash: "SHA-256",
+                },
+                true, // Exportable (not strictly needed here, but common)
+                ["verify"]
+            );
+            console.log("Public key imported successfully.");
+        } catch (e) {
+            console.error("Error importing public key:", e);
+            throw e; // Re-throw to stop the flow
+        }
+    }
+
 
     // 创建并插入所有UI元素
     function createUIElements() {
@@ -716,6 +719,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       successMessage.id = 'successMessage';
       successMessage.className = 'success-message';
       successMessage.textContent = 'Verification successful';
+      successMessage.style.display = 'none'; // Initially hidden
       jsContent.appendChild(successMessage);
 
       // 创建验证表单
@@ -746,6 +750,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       const wayCodeInput = document.createElement('input');
       wayCodeInput.type = 'hidden';
       wayCodeInput.name = PARAM_WAY_CODE; // Obfuscated name
+      wayCodeInput.id = 'wayCodeInput'; // Add ID for easy access
       wayCodeInput.value = wayCode;
       form.appendChild(wayCodeInput);
 
@@ -767,14 +772,21 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       supportInput.id = 'clientSupportInput'; // Add ID for easy access
       form.appendChild(supportInput);
 
-      const signatureInput = document.createElement('input');
-      signatureInput.type = 'hidden';
-      signatureInput.name = PARAM_SIGNATURE; // Obfuscated name
-      signatureInput.id = 'signatureInput'; // Add ID for easy access
-      form.appendChild(signatureInput);
+      // Fields for data integrity verification
+      const dataStringInput = document.createElement('input');
+      dataStringInput.type = 'hidden';
+      dataStringInput.name = PARAM_DATA_STRING; // Obfuscated name
+      dataStringInput.id = 'dataStringInput'; // Add ID for easy access
+      form.appendChild(dataStringInput);
+
+      const dataHashInput = document.createElement('input');
+      dataHashInput.type = 'hidden';
+      dataHashInput.name = PARAM_DATA_HASH; // Obfuscated name
+      dataHashInput.id = 'dataHashInput'; // Add ID for easy access
+      form.appendChild(dataHashInput);
 
 
-      // 添加提交按钮 (仍然隐藏，通过JS触发)
+      // Add submit button (still hidden, triggered by JS)
       const submitBtn = document.createElement('button');
       submitBtn.id = 'submitBtn';
       submitBtn.type = 'submit';
@@ -784,14 +796,15 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
 
       jsContent.appendChild(form);
 
-      // 创建等待消息
+      // Create waiting message
       const waitingMessage = document.createElement('div');
       waitingMessage.id = 'waitingMessage';
       waitingMessage.className = 'waiting-message';
       waitingMessage.textContent = "Waiting for " + hostname + " to respond...";
+      waitingMessage.style.display = 'none'; // Initially hidden
       jsContent.appendChild(waitingMessage);
 
-      // 创建附加文本
+      // Create additional text
       const additionalText = document.createElement('div');
       additionalText.id = 'additionalText';
       additionalText.className = 'additional-text';
@@ -799,7 +812,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       jsContent.appendChild(additionalText);
     }
 
-    // 创建页脚
+    // Create footer
     function createFooter() {
       const footer = document.createElement('div');
       footer.className = 'footer';
@@ -817,7 +830,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
       document.body.appendChild(footer);
     }
 
-    // 初始化验证流程
+    // Initialize verification flow
     async function initVerificationFlow() {
       // Check client capabilities (WebGL, Canvas)
       const support = checkClientSupport();
@@ -828,7 +841,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
        console.log("Client support:", support);
 
 
-      // 检查cookies是否启用
+      // Check if cookies are enabled
       if (!areCookiesEnabled()) {
         const statusText = document.getElementById('statusText');
         if (statusText) {
@@ -840,7 +853,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
         return;
       }
 
-      // 检查是否存在会话cookie
+      // Check for existing session cookie
       const existingSessionCookie = getCookie(COOKIE_NAME_SESSION);
       const sessionCookieInput = document.getElementById('sessionCookieInput');
 
@@ -867,10 +880,9 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
              console.log("Proceeding with Turnstile verification.");
              // Turnstile script is already in the head and will auto-render
              // The onTurnstileSuccess callback will be called upon completion
-             const statusText = document.getElementById('statusText');
-             if (statusText) {
-               statusText.textContent = 'Verifying your connection.'; // Neutral text
-             }
+             // StatusText remains 'Verifying your connection.'
+             showTurnstile();
+             showAdditionalText();
          } else {
              // If no Turnstile, and session cookie is valid, proceed with supplemental PoW if required
              console.log("No Turnstile configured. Proceeding with supplemental PoW if required.");
@@ -884,20 +896,14 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
          }
 
       } else {
-        // 没有找到会话cookie，请求一个新的 (requires initial PoW)
+        // No session cookie found, request a new one (requires initial PoW)
         console.log("No existing session cookie found. Solving initial PoW to get session cookie.");
          if (powChallenge && powChallenge.type === 'initial') {
+             // StatusText remains 'Verifying your connection.'
              await solveAndFetchSessionCookie(wayCode, powChallenge);
          } else {
               console.error("Initial PoW challenge not provided.");
-              const statusText = document.getElementById('statusText');
-              if (statusText) {
-                statusText.textContent = 'Verification error. Please try again.';
-              }
-              hideTurnstile();
-              hideAdditionalText();
-               // 5 seconds delay before refreshing
-               setTimeout(() => { window.location.reload(); }, 5000);
+              handleVerificationError('Verification error. Please try again.');
          }
       }
     }
@@ -930,10 +936,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
 
     // Solve Initial PoW and then fetch session cookie
     async function solveAndFetchSessionCookie(code, challenge) {
-        const statusText = document.getElementById('statusText');
-        if (statusText) {
-           statusText.textContent = 'Performing security check...'; // Neutral text
-        }
+        // StatusText remains 'Verifying your connection.'
         hideTurnstile();
         hideAdditionalText();
 
@@ -944,9 +947,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
         const endTime = Date.now();
         console.log(\`Initial PoW solved in \${endTime - startTime} ms with nonce: \${nonce}\`);
 
-        if (statusText) {
-           statusText.textContent = 'Security check passed. Getting session...'; // Neutral text
-        }
+        // StatusText remains 'Verifying your connection.'
 
         // Fetch session cookie with the solved PoW nonce and client support
         await fetchSessionCookie(code, nonce, checkClientSupport());
@@ -1001,21 +1002,14 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
 
      // Solve Supplemental PoW and submit the form (used when Turnstile is not present or as supplemental)
      async function solveAndSubmitPoW() {
-         const statusText = document.getElementById('statusText');
-         if (statusText) {
-            statusText.textContent = 'Performing additional security check...'; // Neutral text
-         }
+         // StatusText remains 'Verifying your connection.'
          hideTurnstile();
          hideAdditionalText();
 
 
          if (!powChallenge || powChallenge.type !== 'supplemental') {
               console.error("Supplemental PoW challenge not provided for submission.");
-               if (statusText) {
-                 statusText.textContent = 'Verification error. Please try again.';
-               }
-               // 5 seconds delay before refreshing
-               setTimeout(() => { window.location.reload(); }, 5000);
+               handleVerificationError('Verification error. Please try again.');
               return;
          }
 
@@ -1028,18 +1022,12 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
          const powNonceInput = document.getElementById('powNonceInput');
          if (powNonceInput) {
              powNonceInput.value = nonce;
-             if (statusText) {
-                statusText.textContent = 'Security check passed. Submitting...'; // Neutral text
-             }
+             // StatusText remains 'Verifying your connection.'
               // Submit the form after solving PoW
              submitVerificationForm();
          } else {
              console.error("PoW nonce input field not found!");
-              if (statusText) {
-                statusText.innerText = 'An internal error occurred.';
-              }
-               // 5 seconds delay before refreshing
-               setTimeout(() => { window.location.reload(); }, 5000);
+              handleVerificationError('An internal error occurred.');
          }
      }
 
@@ -1122,10 +1110,7 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
              // Proceed to Turnstile verification if configured, or supplemental PoW
              if (siteKey) {
                  console.log("Proceeding with Turnstile verification after getting session cookie.");
-                 const statusText = document.getElementById('statusText');
-                 if (statusText) {
-                   statusText.textContent = 'Verifying your connection.'; // Neutral text
-                 }
+                 // StatusText remains 'Verifying your connection.'
                   showTurnstile();
                   showAdditionalText();
                  // Turnstile script will auto-render, onTurnstileSuccess will handle next step (supplemental PoW or submit)
@@ -1185,71 +1170,67 @@ function buildVerificationHtml(siteKey: string | undefined, requestUrl: URL, hos
         const statusText = document.getElementById('statusText');
 
         if (verificationForm) {
-            // Before submitting, gather data and sign it
-            const wayCode = document.getElementById('wayCodeInput')?.value; // Assuming wayCodeInput exists
+            // Before submitting, gather data and hash it using the public key
+            const wayCode = document.getElementById('wayCodeInput')?.value;
             const sessionCookieValue = document.getElementById('sessionCookieInput')?.value;
             const powNonce = document.getElementById('powNonceInput')?.value || ''; // PoW nonce might be empty if not required
-            const clientSupport = document.getElementById('clientSupportInput')?.value; // JSON string
-            const redirectPath = verificationForm.querySelector('input[name="redirect_path"]')?.value;
-            const turnstileResponse = verificationForm.querySelector('input[name="cf-turnstile-response"]')?.value || ''; // Turnstile response might be empty
+            const clientSupport = document.getElementById('clientSupportInput')?.value || ''; // JSON string
+            const redirectPath = verificationForm.querySelector('input[name="redirect_path"]')?.value || '';
+            const turnstileResponse = verificationForm.querySelector(\`input[name="\${PARAM_TURNSTILE_RESPONSE}"]\`)?.value || ''; // Turnstile response might be empty
 
-            // Data to sign: A consistent string representation of the important fields
-            // Order matters for signing!
-            const dataToSign = \`way_code=\${wayCode}&session=\${sessionCookieValue}&pow=\${powNonce}&support=\${clientSupport}&redirect=\${redirectPath}&turnstile=\${turnstileResponse}\`;
+            // Data to hash: A consistent string representation of the important fields
+            // Order matters for hashing!
+            const dataToHashString = \`way_code=\${wayCode}&session=\${sessionCookieValue}&pow=\${powNonce}&support=\${clientSupport}&redirect=\${redirectPath}&turnstile=\${turnstileResponse}\`;
 
-            console.log("Data to sign:", dataToSign);
+            console.log("Data to hash:", dataToHashString);
 
-            // Request signature from the server
+            if (!serverPublicKey) {
+                 console.error("Public key not loaded, cannot hash data.");
+                 handleVerificationError('Verification error. Security key not available.');
+                 return;
+            }
+
             try {
-                 const signatureResponse = await fetch('/_firewayService/sign', {
-                     method: 'POST',
-                     headers: { 'Content-Type': 'application/json' },
-                     body: JSON.stringify({ data: dataToSign })
-                 });
+                const encoder = new TextEncoder();
+                const dataBuffer = encoder.encode(dataToHashString);
 
-                 if (!signatureResponse.ok) {
-                     const errorText = await signatureResponse.text();
-                     console.error('Failed to get signature:', signatureResponse.status, errorText);
-                     handleVerificationError('Verification error. Failed to get signature.');
+                // Calculate the SHA-256 hash
+                const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                const dataHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+                 console.log("Calculated data hash:", dataHash);
+
+                // Add the data string and its hash to the form
+                const dataStringInput = document.getElementById('dataStringInput');
+                const dataHashInput = document.getElementById('dataHashInput');
+
+                if (dataStringInput && dataHashInput) {
+                    dataStringInput.value = dataToHashString;
+                    dataHashInput.value = dataHash;
+                } else {
+                     console.error("Data string or hash input fields not found!");
+                     handleVerificationError('An internal error occurred.');
                      return;
-                 }
-
-                 const signatureData = await signatureResponse.json();
-                 const signature = signatureData.signature;
-
-                 if (!signature) {
-                     console.error('Signature not received from server.');
-                     handleVerificationError('Verification error. Missing signature.');
-                     return;
-                 }
-
-                 // Add the signature to the form
-                 const signatureInput = document.getElementById('signatureInput');
-                 if (signatureInput) {
-                     signatureInput.value = signature;
-                 } else {
-                      console.error("Signature input field not found!");
-                      handleVerificationError('An internal error occurred.');
-                      return;
-                 }
+                }
 
 
                 // Hide initial status/turnstile, show success/waiting
-                if (statusText) statusText.style.display = 'none';
+                // StatusText remains 'Verifying your connection.'
                 hideAdditionalText();
                 hideTurnstile();
                 if (successMessage) successMessage.style.display = 'block'; // Show success message
                 if (waitingMessage) waitingMessage.style.display = 'block';
 
-                console.log("Submitting verification form with signature.");
-                // Submit the form after getting the signature
+                console.log("Submitting verification form with data and hash.");
+                // Submit the form
                 setTimeout(() => {
                     verificationForm.submit();
                 }, 1000); // Delay submission slightly to show success state
 
             } catch (error) {
-                 console.error('Error getting signature:', error);
-                 handleVerificationError('Verification error. Failed to sign data.');
+                 console.error('Error hashing data:', error);
+                 handleVerificationError('Verification error. Failed to process data.');
             }
 
         } else {
@@ -1920,289 +1901,6 @@ async function handleAdminConsole(req: Request, connInfo: Deno.ServeTlsInfo | De
             headers: { "Content-Type": "text/html; charset=utf-8" },
             status: 200
         });
-    } else if (adminPath === "/config/targetUrl") {
-         // Handle Target URL API
-         if (req.method === "GET") {
-             // Get target URL
-             const targetUrlKv = await kv.get(KV_PREFIX_TARGET_CDN_URL);
-             const currentTargetUrl = targetUrlKv.value !== null && typeof targetUrlKv.value === 'string' ? targetUrlKv.value : TARGET_CDN_URL_ENV; // Fallback to env if not in KV
-             return new Response(JSON.stringify({ targetUrl: currentTargetUrl }), {
-                 headers: { "Content-Type": "application/json" },
-                 status: 200
-             });
-         } else if (req.method === "POST") {
-             // Set target URL
-             try {
-                 const { targetUrl } = await req.json();
-                 if (typeof targetUrl === 'string' && targetUrl.trim() !== '') {
-                     const urlToSet = targetUrl.trim();
-                     // Basic URL validation
-                     try {
-                         new URL(urlToSet);
-                     } catch (e) {
-                         return new Response(`Invalid URL format: ${e.message}`, { status: 400 });
-                     }
-
-                     await kv.set(KV_PREFIX_TARGET_CDN_URL, urlToSet);
-                     TARGET_CDN_URL = urlToSet; // Update the global variable immediately
-                     console.log(`Proxy target URL updated to "${urlToSet}" by admin.`);
-                     return new Response("Target URL updated", { status: 200 });
-                 } else {
-                     return new Response("Invalid target URL provided", { status: 400 });
-                 }
-             } catch (e) {
-                 console.error("Error setting target URL:", e);
-                 return new Response("Error setting target URL", { status: 500 });
-             }
-         } else {
-             return new Response("Method Not Allowed", { status: 405 });
-         }
-    } else if (adminPath === "/blacklist") {
-        // Handle IP Blacklist API
-        if (req.method === "GET") {
-            // List blacklisted IPs
-            const entries = kv.list({ prefix: KV_PREFIX_IP_BLACKLIST });
-            const ips = [];
-            for await (const entry of entries) {
-                // The key is ["ip_blacklist", "ip_address"]
-                if (Array.isArray(entry.key) && entry.key.length === 2 && typeof entry.key[1] === 'string') {
-                     ips.push(entry.key[1]);
-                }
-            }
-            return new Response(JSON.stringify(ips), {
-                headers: { "Content-Type": "application/json" },
-                status: 200
-            });
-        } else if (req.method === "POST") {
-            // Add IP to blacklist
-            try {
-                const { ip } = await req.json();
-                if (typeof ip === 'string' && ip.trim() !== '') {
-                    const ipToBlacklist = ip.trim();
-                    // Basic validation (can be improved)
-                    // Allows IPv4, IPv6, and CIDR notations (simple check)
-                    if (!/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(\/\d{1,2})?)|([0-9a-fA-F:]+(\/\d{1,3})?)$/.test(ipToBlacklist)) {
-                         return new Response("Invalid IP or CIDR format", { status: 400 });
-                    }
-                    // Store the IP in KV. Value can be anything, like true or timestamp.
-                    await kv.set([...KV_PREFIX_IP_BLACKLIST, ipToBlacklist], true);
-                    console.log(`IP ${ipToBlacklist} added to blacklist by admin.`);
-                    return new Response("IP added", { status: 200 });
-                } else {
-                    return new Response("Invalid IP provided", { status: 400 });
-                }
-            } catch (e) {
-                console.error("Error adding IP to blacklist:", e);
-                return new Response("Error adding IP", { status: 500 });
-            }
-        } else if (req.method === "DELETE") {
-            // Remove IP from blacklist
-             try {
-                const { ip } = await req.json();
-                if (typeof ip === 'string' && ip.trim() !== '') {
-                    const ipToRemove = ip.trim();
-                    // Delete the key from KV
-                    await kv.delete([...KV_PREFIX_IP_BLACKLIST, ipToRemove]);
-                     console.log(`IP ${ipToRemove} removed from blacklist by admin.`);
-                    return new Response("IP removed", { status: 200 });
-                } else {
-                    return new Response("Invalid IP provided", { status: 400 });
-                }
-            } catch (e) {
-                console.error("Error removing IP from blacklist:", e);
-                return new Response("Error removing IP", { status: 500 });
-            }
-        } else {
-            return new Response("Method Not Allowed", { status: 405 });
-        }
-    } else if (adminPath === "/waf/rules") {
-         // Handle WAF Rules API
-         if (req.method === "GET") {
-             // List WAF rules
-             // WAF rules are stored as a single value in KV
-             const wafRulesKv = await kv.get(KV_PREFIX_WAF_RULES);
-             const rules = wafRulesKv.value !== null && Array.isArray(wafRulesKv.value) ? wafRulesKv.value : [];
-             return new Response(JSON.stringify(rules), {
-                 headers: { "Content-Type": "application/json" },
-                 status: 200
-             });
-         } else if (req.method === "POST") {
-             // Add WAF rule
-             try {
-                 const { rule } = await req.json();
-                 if (typeof rule === 'string' && rule.trim() !== '') {
-                     const ruleToAdd = rule.trim();
-                     // Get current rules, add the new one, save back to KV
-                     const wafRulesKv = await kv.get(KV_PREFIX_WAF_RULES);
-                     const currentRules = wafRulesKv.value !== null && Array.isArray(wafRulesKv.value) ? wafRulesKv.value as string[] : [];
-
-                     if (!currentRules.includes(ruleToAdd)) {
-                         currentRules.push(ruleToAdd);
-                         await kv.set(KV_PREFIX_WAF_RULES, currentRules);
-                         compileWafRules(); // Recompile rules immediately
-                         console.log(`WAF rule "${ruleToAdd}" added by admin.`);
-                     } else {
-                         console.log(`WAF rule "${ruleToAdd}" already exists.`);
-                     }
-
-                     return new Response("WAF rule added", { status: 200 });
-                 } else {
-                     return new Response("Invalid WAF rule provided", { status: 400 });
-                 }
-             } catch (e) {
-                 console.error("Error adding WAF rule:", e);
-                 return new Response("Error adding WAF rule", { status: 500 });
-             }
-         } else if (req.method === "DELETE") {
-             // Remove WAF rule
-              try {
-                 const { rule } = await req.json();
-                 if (typeof rule === 'string' && rule.trim() !== '') {
-                     const ruleToRemove = rule.trim();
-                     // Get current rules, filter out the one to remove, save back to KV
-                     const wafRulesKv = await kv.get(KV_PREFIX_WAF_RULES);
-                     const currentRules = wafRulesKv.value !== null && Array.isArray(wafRulesKv.value) ? wafRulesKv.value as string[] : [];
-
-                     const updatedRules = currentRules.filter(r => r !== ruleToRemove);
-
-                     if (updatedRules.length < currentRules.length) {
-                         await kv.set(KV_PREFIX_WAF_RULES, updatedRules);
-                         compileWafRules(); // Recompile rules immediately
-                         console.log(`WAF rule "${ruleToRemove}" removed by admin.`);
-                         return new Response("WAF rule removed", { status: 200 });
-                     } else {
-                         console.log(`WAF rule "${ruleToRemove}" not found.`);
-                         return new Response("WAF rule not found", { status: 404 });
-                     }
-
-                 } else {
-                     return new Response("Invalid WAF rule provided", { status: 400 });
-                 }
-             } catch (e) {
-                 console.error("Error removing WAF rule:", e);
-                 return new Response("Error removing WAF rule", { status: 500 });
-             }
-         } else {
-             return new Response("Method Not Allowed", { status: 405 });
-         }
-    } else if (adminPath === "/exempt/paths") {
-        // Handle Exempt Paths API
-        if (req.method === "GET") {
-            // List exempt paths
-            const exemptPathsKv = await kv.get(KV_PREFIX_EXEMPT_PATHS);
-            const paths = exemptPathsKv.value !== null && Array.isArray(exemptPathsKv.value) ? exemptPathsKv.value : [];
-            return new Response(JSON.stringify(paths), {
-                headers: { "Content-Type": "application/json" },
-                status: 200
-            });
-        } else if (req.method === "POST") {
-            // Add exempt path
-            try {
-                const { path } = await req.json();
-                if (typeof path === 'string' && path.trim() !== '') {
-                    const pathToAdd = path.trim();
-                    // Get current paths, add the new one, save back to KV
-                    const exemptPathsKv = await kv.get(KV_PREFIX_EXEMPT_PATHS);
-                    const currentPaths = exemptPathsKv.value !== null && Array.isArray(exemptPathsKv.value) ? exemptPathsKv.value as string[] : [];
-
-                    // Basic format validation for regex paths
-                    if (pathToAdd.startsWith("/^") && !pathToAdd.endsWith("$/")) {
-                        return new Response("Invalid regex path format: must end with '$/'", { status: 400 });
-                    } else if (!pathToAdd.startsWith("/^") && pathToAdd.endsWith("$/")) {
-                         return new Response("Invalid regex path format: must start with '/^'", { status: 400 });
-                    } else if (pathToAdd.startsWith("/^") && pathToAdd.endsWith("$/")) {
-                         // Validate regex itself
-                         try {
-                              new RegExp(pathToAdd.substring(2, pathToAdd.length - 2));
-                         } catch (e) {
-                             return new Response(`Invalid regex pattern: ${e.message}`, { status: 400 });
-                         }
-                    } else if (!pathToAdd.startsWith("/")) {
-                         return new Response("Invalid path format: must start with '/' or '/^'", { status: 400 });
-                    }
-
-
-                    if (!currentPaths.includes(pathToAdd)) {
-                        currentPaths.push(pathToAdd);
-                        await kv.set(KV_PREFIX_EXEMPT_PATHS, currentPaths);
-                        compileExemptPaths(); // Recompile paths immediately
-                        console.log(`Exempt path "${pathToAdd}" added by admin.`);
-                    } else {
-                        console.log(`Exempt path "${pathToAdd}" already exists.`);
-                    }
-
-                    return new Response("Exempt path added", { status: 200 });
-                } else {
-                    return new Response("Invalid exempt path provided", { status: 400 });
-                }
-            } catch (e) {
-                console.error("Error adding exempt path:", e);
-                return new Response("Error adding exempt path", { status: 500 });
-            }
-        } else if (req.method === "DELETE") {
-            // Remove exempt path
-             try {
-                const { path } = await req.json();
-                if (typeof path === 'string' && path.trim() !== '') {
-                    const pathToRemove = path.trim();
-                    // Get current paths, filter out the one to remove, save back to KV
-                    const exemptPathsKv = await kv.get(KV_PREFIX_EXEMPT_PATHS);
-                    const currentPaths = exemptPathsKv.value !== null && Array.isArray(exemptPathsKv.value) ? exemptPathsKv.value as string[] : [];
-
-                    const updatedPaths = currentPaths.filter(p => p !== pathToRemove);
-
-                     // Ensure Admin Console path is always exempt
-                     const adminConsolePath = "/_firewayService";
-                     if (!updatedPaths.includes(adminConsolePath)) {
-                         updatedPaths.push(adminConsolePath);
-                     }
-
-                    if (updatedPaths.length < currentPaths.length) {
-                        await kv.set(KV_PREFIX_EXEMPT_PATHS, updatedPaths);
-                        compileExemptPaths(); // Recompile paths immediately
-                        console.log(`Exempt path "${pathToRemove}" removed by admin.`);
-                        return new Response("Exempt path removed", { status: 200 });
-                    } else {
-                        console.log(`Exempt path "${pathToRemove}" not found.`);
-                        return new Response("Exempt path not found", { status: 404 });
-                    }
-
-                 } else {
-                     return new Response("Invalid exempt path provided", { status: 400 });
-                 }
-             } catch (e) {
-                 console.error("Error removing exempt path:", e);
-                 return new Response("Error removing exempt path", { status: 500 });
-             }
-         } else {
-             return new Response("Method Not Allowed", { status: 405 });
-         }
-    } else if (adminPath === "/sign" && req.method === "POST") {
-        // Handle data signing request from the client for /fireway/requestClear
-        if (!privateCryptoKey) {
-             console.error("Private key not loaded, cannot sign data for /fireway/requestClear.");
-             return new Response("Internal server error: Signing key not available.", { status: 500 });
-        }
-        try {
-            const { data } = await req.json();
-            if (typeof data === 'string') {
-                const signature = await signData(data);
-                if (signature) {
-                    return new Response(JSON.stringify({ signature }), {
-                         headers: { "Content-Type": "application/json" },
-                         status: 200
-                    });
-                } else {
-                     console.error("Failed to generate signature for data.");
-                     return new Response("Internal server error: Failed to generate signature.", { status: 500 });
-                }
-            } else {
-                return new Response("Invalid data format for signing.", { status: 400 });
-            }
-        } catch (e) {
-            console.error("Error processing signing request:", e);
-            return new Response("Internal server error.", { status: 500 });
-        }
     }
 
 
@@ -2278,11 +1976,10 @@ async function loadConfigFromKv() {
             TARGET_CDN_URL = TARGET_CDN_URL_ENV; // Use env default if not in KV
         }
 
-         // Load Private Key for signing
-         if (PRIVATE_KEY_PEM) {
-             privateCryptoKey = await importPrivateKey(PRIVATE_KEY_PEM);
-         } else {
-              console.warn("WARNING: PRIVATE_KEY_PEM environment variable is not set. Data signing for /fireway/requestClear will be disabled.");
+         // Generate Public Key for data integrity verification on startup
+         publicCryptoKeyJWK = await generateAndExportPublicKey();
+         if (!publicCryptoKeyJWK) {
+             console.error("Failed to generate public key. Data integrity verification will be disabled.");
          }
 
 
@@ -2301,7 +1998,7 @@ async function loadConfigFromKv() {
         compileExemptPaths();
         // Fallback for Target CDN URL
         TARGET_CDN_URL = TARGET_CDN_URL_ENV;
-        // Private key loading failure is handled by the importPrivateKey function
+        // Public key generation failure is handled by the function
     }
 }
 
@@ -2331,7 +2028,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
             }
             if (typeof pow_nonce !== 'string' || pow_nonce.trim() === '') {
                  console.warn(`Missing or invalid PoW nonce in /_firewayService/session from IP ${clientIp}. Way Code: ${way_code}`);
-                 return new Response("Missing or invalid PoW nonce.", { status: 400 });
+                 return new Response("Missing or invalid security check solution.", { status: 400 });
             }
 
             // Retrieve the PoW challenge associated with this Way Code
@@ -2339,7 +2036,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
 
             if (powChallengeKvEntry.value === null) {
                  console.warn(`No active PoW challenge found for Way Code ${way_code} from IP ${clientIp}.`);
-                 return new Response("Invalid or expired Way Code/Challenge.", { status: 400 });
+                 return new Response("Invalid or expired challenge.", { status: 400 });
             }
 
             const powChallenge = powChallengeKvEntry.value as { target: string, difficulty: number, type: 'initial' | 'supplemental' };
@@ -2426,7 +2123,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
                 await kv.delete([...KV_PREFIX_WAY_CODE, way_code]);
                 await kv.delete([...KV_PREFIX_POW_CHALLENGE, way_code]);
                 // Invalid Way Code or IP mismatch
-                return new Response("Invalid or expired Way Code.", { status: 400 });
+                return new Response("Invalid or expired challenge.", { status: 400 });
             }
         } catch (e) {
             console.error("Error handling session cookie request:", e);
@@ -2455,11 +2152,11 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
       // The buildVerificationHtml function also handles this case by showing an error page.
   }
 
-  // Check if private key is loaded for signing
-   if (!privateCryptoKey) {
-        console.error("Private key is not loaded. Data signing is disabled.");
+  // Check if public key is loaded for verification
+   if (!publicCryptoKeyJWK) {
+        console.error("Public key is not loaded. Data integrity verification is disabled.");
         // Depending on your security requirements, you might want to block requests here
-        // or proceed without signing (less secure). For now, we log and continue.
+        // or proceed without verification (less secure). For now, we log and continue.
    }
 
 
@@ -2515,7 +2212,9 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
     const submittedSessionCookie = formData.get(PARAM_SESSION_COOKIE_VALUE)?.toString();
     const powNonce = formData.get(PARAM_POW_NONCE)?.toString();
     const clientSupportStr = formData.get(PARAM_CLIENT_SUPPORT)?.toString();
-    const signature = formData.get(PARAM_SIGNATURE)?.toString(); // Get the signature
+    const dataString = formData.get(PARAM_DATA_STRING)?.toString(); // Get the data string
+    const dataHash = formData.get(PARAM_DATA_HASH)?.toString(); // Get the data hash
+
 
     // Keep redirect_path as is for server-side redirection
     const redirectPath = formData.get('redirect_path')?.toString() || "/";
@@ -2531,55 +2230,39 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
          return new Response("Verification error: Missing session state.", { status: 400 });
      }
 
-    // Data string construction must EXACTLY match the client-side signing
-    const dataToVerify = `way_code=${wayCode}&session=${submittedSessionCookie}&pow=${powNonce || ''}&support=${clientSupportStr || ''}&redirect=${redirectPath || ''}&turnstile=${turnstileToken || ''}`;
+    // --- Data Integrity Verification ---
+    let isDataIntegrityValid = true; // Assume valid if verification is disabled
+    if (publicCryptoKeyJWK) { // Only attempt verification if public key was generated
+        if (!dataString || !dataHash) {
+             console.warn(`Missing data string or hash in verification request from IP ${clientIp}.`);
+             isDataIntegrityValid = false; // Treat as invalid if data for verification is missing
+        } else {
+             try {
+                 const encoder = new TextEncoder();
+                 const dataBuffer = encoder.encode(dataString);
 
-    // Verify the signature if the private key is loaded
-    let isSignatureValid = true; // Assume valid if signing is disabled
-    if (privateCryptoKey && signature) {
-        try {
-             // Decode Base64Url signature back to ArrayBuffer
-             const base64Signature = signature.replace(/-/g, '+').replace(/_/g, '/');
-             const signatureBuffer = decodeBase64(base64Signature);
+                 // Re-calculate the hash on the server side
+                 const serverHashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
+                 const serverHashArray = Array.from(new Uint8Array(serverHashBuffer));
+                 const serverDataHash = serverHashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-             const encoder = new TextEncoder();
-             const dataBuffer = encoder.encode(dataToVerify);
-
-             // Import the public key (you'd need to expose the public key or derive it)
-             // For this example, we'll assume the private key is loaded and can be used for verification (for testing purposes).
-             // In a real scenario, you'd import the *public* key here.
-             // Since we are using the same key for sign/verify in this simplified example,
-             // we'll use the loaded private key's algorithm and hash properties for verification.
-              const isValid = await crypto.subtle.verify(
-                  {
-                      name: "RSASSA-PKCS1-v1_5",
-                      hash: "SHA-256",
-                  },
-                  privateCryptoKey, // Using private key for verify (TESTING ONLY) - REPLACE WITH PUBLIC KEY
-                  signatureBuffer,
-                  dataBuffer
-              );
-             isSignatureValid = isValid;
-             if (!isSignatureValid) {
-                 console.warn(`Signature verification failed for IP ${clientIp}. Data: "${dataToVerify}" Signature: "${signature}"`);
-             } else {
-                 console.log(`Signature verification successful for IP ${clientIp}.`);
+                 // Compare server-calculated hash with client-provided hash
+                 if (serverDataHash !== dataHash) {
+                     console.warn(`Data integrity check failed for IP ${clientIp}. Client hash: "${dataHash}", Server hash: "${serverDataHash}". Data string: "${dataString}"`);
+                     isDataIntegrityValid = false;
+                 } else {
+                     console.log(`Data integrity check successful for IP ${clientIp}.`);
+                 }
+             } catch (e) {
+                 console.error("Error performing data integrity check:", e);
+                 isDataIntegrityValid = false; // Verification failed due to error
              }
-
-        } catch (e) {
-             console.error("Error verifying signature:", e);
-             isSignatureValid = false; // Signature verification failed due to error
         }
-    } else if (privateCryptoKey && !signature) {
-        // Private key is loaded but no signature was provided
-         console.warn(`Private key loaded but no signature provided in verification request from IP ${clientIp}.`);
-         isSignatureValid = false; // Treat as invalid if signature is expected but missing
     }
 
-
-     if (!isSignatureValid) {
-          console.warn(`Verification failed for IP ${clientIp} due to invalid or missing signature.`);
-          return new Response("Verification failed: Invalid data signature.", { status: 403 });
+     if (!isDataIntegrityValid) {
+          console.warn(`Verification failed for IP ${clientIp} due to invalid or missing data integrity.`);
+          return new Response("Verification failed: Data integrity check failed.", { status: 403 });
      }
 
 
@@ -2633,14 +2316,14 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
     if (requiredSupplementalPowDifficulty > 0) {
         if (!powNonce) {
              console.warn(`Missing required supplemental PoW nonce for IP ${clientIp}. Required difficulty: ${requiredSupplementalPowDifficulty}`);
-             return new Response("Missing required security challenge solution.", { status: 400 });
+             return new Response("Missing required security check solution.", { status: 400 });
         }
         // Retrieve the PoW challenge associated with this Way Code
         const powChallengeKvEntry = await kv.get([...KV_PREFIX_POW_CHALLENGE, wayCode]);
 
         if (powChallengeKvEntry.value === null) {
              console.warn(`No active supplemental PoW challenge found for Way Code ${wayCode} during /fireway/requestClear from IP ${clientIp}.`);
-             return new Response("Invalid or expired Way Code/Challenge.", { status: 400 });
+             return new Response("Invalid or expired challenge.", { status: 400 });
         }
 
         const powChallenge = powChallengeKvEntry.value as { target: string, difficulty: number, type: 'initial' | 'supplemental' };
@@ -2660,7 +2343,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
              // Delete the used Way Code and PoW challenge on failure
              await kv.delete([...KV_PREFIX_WAY_CODE, wayCode]);
              await kv.delete([...KV_PREFIX_POW_CHALLENGE, wayCode]);
-             return new Response("Invalid security challenge solution.", { status: 403 });
+             return new Response("Invalid security check solution.", { status: 403 });
         }
         console.log(`Supplemental PoW solution valid for Way Code ${wayCode} from IP ${clientIp}.`);
 
@@ -2669,8 +2352,8 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
     }
 
 
-     // Final verification decision: Pass if Session is valid AND (Turnstile passes OR Supplemental PoW passes)
-     const isVerificationSuccessful = sessionKvEntry.value === clientIp && (isTurnstileHuman || (requiredSupplementalPowDifficulty > 0 && isSupplementalPowValid));
+     // Final verification decision: Pass if Session is valid AND Data Integrity is valid AND (Turnstile passes OR Supplemental PoW passes)
+     const isVerificationSuccessful = sessionKvEntry.value === clientIp && isDataIntegrityValid && (isTurnstileHuman || (requiredSupplementalPowDifficulty > 0 && isSupplementalPowValid));
 
 
     if (isVerificationSuccessful) {
@@ -2723,7 +2406,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
 
     } else {
       console.log(`Verification failed for IP ${clientIp}. Re-initiating verification.`);
-      // If verification failed (e.g., Turnstile failed, supplemental PoW failed),
+      // If verification failed (e.g., Turnstile failed, supplemental PoW failed, data integrity failed),
       // delete the session cookie and Way Code, and return a failure response.
       // The client will need to start the process over.
        await kv.delete([...KV_PREFIX_SESSION_COOKIE, submittedSessionCookie]);
@@ -2817,7 +2500,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
          await kv.set([...KV_PREFIX_POW_CHALLENGE, newWayCode], initialPowChallenge, { expireIn: 5 * 60 * 1000 }); // PoW challenge expires with Way Code
 
 
-         const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, initialPowChallenge); // Pass the new Way Code and PoW challenge
+         const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, publicCryptoKeyJWK, initialPowChallenge); // Pass the new Way Code, Public Key JWK, and PoW challenge
 
          const response = new Response(verificationHtml, {
            headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -2880,7 +2563,7 @@ async function handler(req: Request, connInfo: Deno.ServeTlsInfo | Deno.ServeHtt
          }
 
 
-        const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, supplementalPowChallenge); // Pass the new Way Code and potential supplemental PoW
+        const verificationHtml = buildVerificationHtml(CF_TURNSTILE_SITE_KEY, url, hostname, newWayCode, publicCryptoKeyJWK, supplementalPowChallenge); // Pass the new Way Code, Public Key JWK, and potential supplemental PoW
 
          const response = new Response(verificationHtml, {
            headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -2963,7 +2646,16 @@ if (ADMIN_PASSWORD_HASH === DEFAULT_ADMIN_PASSWORD_HASH) {
 if (!CF_TURNSTILE_SITE_KEY || !CF_TURNSTILE_SECRET_KEY) {
     console.warn("WARNING: Cloudflare Turnstile keys (CF_TURNSTILE_SITE_KEY, CF_TURNSTILE_SECRET_KEY) are not set. Verification will rely heavily on PoW.");
 }
-if (!PRIVATE_KEY_PEM || !privateCryptoKey) {
-     console.warn("WARNING: PRIVATE_KEY_PEM environment variable is not set or key failed to load. Data signing for /fireway/requestClear is disabled. This reduces security against tampering.");
+if (!publicCryptoKeyJWK) {
+     console.error("ERROR: Public key failed to generate on startup. Data integrity verification for /fireway/requestClear is disabled. This significantly reduces security against tampering.");
 }
 await serve(handler, { port: LISTEN_PORT });
+
+// Uncomment and run this section once to generate your password hash
+// console.log("Generating SHA-256 hash for 'mysecretpassword123':");
+// console.log(await generateSha256Hash("mysecretpassword123"));
+// Then set the output as ADMIN_PASSWORD_HASH environment variable.
+
+// Note: The private key is now only needed if you want to implement server-to-client signing,
+// which is not required for client data integrity verification.
+// You no longer need to generate and set PRIVATE_KEY_PEM for this specific data integrity check.
